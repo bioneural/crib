@@ -226,4 +226,4 @@ Run `bin/crib doctor` to verify all prerequisites are installed and report statu
 
 ## License
 
-MIT
+MIT — Fort Asset LLC
