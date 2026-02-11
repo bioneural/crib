@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# crib — memory storage and retrieval for Claude Code agents
+# crib — memory storage and retrieval for AI agents
 # https://github.com/bioneural/crib
 # MIT License — Copyright (c) 2026 Fort Asset LLC
 #
