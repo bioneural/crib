@@ -85,7 +85,9 @@ Model overrides are documented in [Prerequisites](#prerequisites).
 
 ## Claude Code integration
 
-Crib integrates with Claude Code via [hooker](https://github.com/bioneural/hooker), a policy engine for Claude Code hooks. A hooker policy wires retrieval to every prompt:
+Crib integrates with Claude Code via [hooker](https://github.com/bioneural/hooker), a policy engine for Claude Code hooks.
+
+**Retrieve** is automated. A hooker inject policy fires on every prompt, pipes the prompt text to `bin/crib retrieve` via stdin, and injects whatever crib returns on stdout as additional context. If crib finds nothing relevant, stdout is empty and nothing is injected.
 
 ```ruby
 policy "Memory" do
@@ -94,13 +96,17 @@ policy "Memory" do
 end
 ```
 
-Hooker pipes the user's prompt to stdin and injects stdout as additional context. Empty stdout means nothing is injected. Write calls happen from the agent via shell:
+**Write** is agent-initiated. The agent decides what's worth persisting — a decision it made, an error it encountered, a correction to something it previously believed — and calls `bin/crib write` directly:
 
 ```sh
 echo "type=decision Switched from Postgres to SQLite" | bin/crib write
 ```
 
-Crib's interface is stdin/stdout — any agent framework that can pipe text to a command can use it.
+There is no automatic write policy. What to store is a judgment call that belongs to the agent, not to hook plumbing.
+
+---
+
+Crib's interface is stdin/stdout. Any agent framework that can pipe text to a command can use it — hooker is one integration path, not the only one.
 
 ---
 
