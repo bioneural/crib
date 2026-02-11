@@ -30,7 +30,7 @@ Crib extracts triples automatically on write using ollama. You write natural tex
 
 **Write path** — text arrives on stdin. Crib stores it as a full-text entry, generates a vector embedding via ollama, extracts fact triples, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
 
-**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. Results are merged, deduplicated, reranked with ollama if over budget, and wrapped in `<memory>` tags. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
+**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. Results are merged, deduplicated, sorted newest-first, reranked with ollama if over budget, and wrapped in `<memory>` tags with a `context_time` timestamp. Each fact triple includes its `valid_from` date; each memory entry includes its `created_at` date. The consuming agent can reason about recency — whether a memory is older or newer than what's already in the conversation. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
 
 ---
 
@@ -45,11 +45,11 @@ echo "type=decision Chose SQLite for storage." | bin/crib write
 
 # Retrieve relevant context for a prompt
 echo "what database did we choose?" | bin/crib retrieve
-# <memory>
+# <memory context_time="2026-02-11T14:32:00Z">
 # ## Known facts
-# - SQLite → storage_backend → project
+# - SQLite → storage_backend → project (since 2026-02-09)
 # ## Memory entries
-# [decision] Chose SQLite for storage. Zero dependencies.
+# - [2026-02-09 decision] Chose SQLite for storage. Zero dependencies.
 # </memory>
 
 # Initialize the database explicitly (happens automatically on first write)
@@ -191,6 +191,10 @@ Retrieve
   ✓ Retrieve finds fact triples
   ✓ Retrieve finds entries via vector similarity
   ✓ Retrieve wraps output in <memory> tags
+  ✓ Retrieve includes context_time on <memory> tag
+  ✓ Retrieve entries include date prefix
+  ✓ Retrieve triples include since date
+  ✓ Retrieve orders entries newest-first
   ✓ Retrieve with empty input exits cleanly
   ✓ Retrieve with missing database exits cleanly
 
@@ -198,7 +202,7 @@ Consolidation
   ✓ Consolidation-on-write runs without error
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-17 passed
+21 passed
 ```
 
 Tests run against a temporary database that is created and destroyed on each run. No artifacts are left behind.

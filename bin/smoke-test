@@ -185,7 +185,7 @@ section "Retrieve"
 test_retrieve_fts() {
   local output
   output=$(echo "what database for billing?" | "$CRIB" retrieve 2>/dev/null)
-  if echo "$output" | grep -q "<memory>" && echo "$output" | grep -q "PostgreSQL"; then
+  if echo "$output" | grep -q "<memory" && echo "$output" | grep -q "PostgreSQL"; then
     pass "Retrieve finds entries via FTS5"
   else
     fail "Retrieve FTS" "expected <memory> with PostgreSQL, got: $output"
@@ -209,7 +209,7 @@ test_retrieve_vector() {
   local output
   # Semantic query that might not match keywords but should match embeddings
   output=$(echo "which relational database powers invoicing?" | "$CRIB" retrieve 2>/dev/null)
-  if echo "$output" | grep -q "<memory>"; then
+  if echo "$output" | grep -q "<memory"; then
     pass "Retrieve finds entries via vector similarity"
   else
     # Vector search depends on embedding quality — not a hard failure
@@ -222,7 +222,7 @@ test_retrieve_memory_tags() {
   local output
   output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
   if [[ -n "$output" ]]; then
-    if echo "$output" | grep -q "<memory>" && echo "$output" | grep -q "</memory>"; then
+    if echo "$output" | grep -q "<memory" && echo "$output" | grep -q "</memory>"; then
       pass "Retrieve wraps output in <memory> tags"
     else
       fail "Retrieve tags" "output missing <memory> tags"
@@ -232,6 +232,80 @@ test_retrieve_memory_tags() {
   fi
 }
 test_retrieve_memory_tags
+
+test_retrieve_context_time() {
+  local output
+  output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
+  if [[ -n "$output" ]]; then
+    if echo "$output" | grep -qE '<memory context_time="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z">'; then
+      pass "Retrieve includes context_time on <memory> tag"
+    else
+      fail "Retrieve context_time" "expected context_time attribute, got: $(echo "$output" | head -1)"
+    fi
+  else
+    pass "Retrieve returns empty for no match (fail-open)"
+  fi
+}
+test_retrieve_context_time
+
+test_retrieve_entry_timestamps() {
+  local output
+  output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
+  if [[ -n "$output" ]]; then
+    # Entries should have [YYYY-MM-DD type] format
+    if echo "$output" | grep -qE '\[[0-9]{4}-[0-9]{2}-[0-9]{2} [a-z]+\]'; then
+      pass "Retrieve entries include date prefix"
+    else
+      fail "Retrieve entry dates" "expected [YYYY-MM-DD type] format in entries"
+    fi
+  else
+    pass "Retrieve returns empty for no match (fail-open)"
+  fi
+}
+test_retrieve_entry_timestamps
+
+test_retrieve_triple_timestamps() {
+  local output
+  output=$(echo "PostgreSQL billing" | "$CRIB" retrieve 2>/dev/null)
+  if echo "$output" | grep -q "Known facts"; then
+    if echo "$output" | grep -qE '\(since [0-9]{4}-[0-9]{2}-[0-9]{2}\)'; then
+      pass "Retrieve triples include since date"
+    else
+      fail "Retrieve triple dates" "expected (since YYYY-MM-DD) in triples"
+    fi
+  else
+    # Triples depend on extraction quality
+    pass "Retrieve runs without error (triples depend on extraction quality)"
+  fi
+}
+test_retrieve_triple_timestamps
+
+test_retrieve_newest_first() {
+  # Write two entries with distinct content, retrieve, verify order
+  echo "type=note The first entry about testing order" | "$CRIB" write 2>/dev/null
+  sleep 1
+  echo "type=note The second entry about testing order" | "$CRIB" write 2>/dev/null
+
+  local output
+  output=$(echo "testing order entry" | "$CRIB" retrieve 2>/dev/null)
+  if [[ -n "$output" ]]; then
+    # Extract line numbers of first and second entry
+    local first_line second_line
+    first_line=$(echo "$output" | grep -n "first entry" | head -1 | cut -d: -f1)
+    second_line=$(echo "$output" | grep -n "second entry" | head -1 | cut -d: -f1)
+    if [[ -n "$second_line" && -n "$first_line" && "$second_line" -lt "$first_line" ]]; then
+      pass "Retrieve orders entries newest-first"
+    elif [[ -n "$second_line" && -n "$first_line" ]]; then
+      fail "Retrieve order" "second entry should appear before first entry"
+    else
+      # May not have matched both — not a hard failure
+      pass "Retrieve runs (ordering depends on match quality)"
+    fi
+  else
+    pass "Retrieve runs (ordering depends on match quality)"
+  fi
+}
+test_retrieve_newest_first
 
 test_retrieve_empty_input() {
   local exit_code
@@ -269,7 +343,7 @@ test_consolidation() {
   # The old triple should be superseded (valid_until set)
   local output
   output=$(echo "cache backend" | "$CRIB" retrieve 2>/dev/null)
-  if echo "$output" | grep -q "<memory>"; then
+  if echo "$output" | grep -q "<memory"; then
     pass "Consolidation-on-write runs without error"
   else
     pass "Consolidation runs (result depends on extraction quality)"

@@ -29,7 +29,7 @@
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
-#   retrieve  — <memory>...</memory> on stdout (empty = nothing relevant)
+#   retrieve  — <memory context_time="...">...</memory> on stdout (empty = nothing relevant)
 #   init      — status on stderr
 #
 # Dependencies: ruby (stdlib only), sqlite3 (CLI), sqlite-vec (extension), ollama
@@ -438,7 +438,7 @@ def query_fts(keywords)
     FROM entries e
     JOIN entries_fts f ON e.id = f.rowid
     WHERE entries_fts MATCH '#{escape_sql(fts_query)}'
-    ORDER BY rank
+    ORDER BY e.created_at DESC
     LIMIT 10;
   SQL
 end
@@ -462,21 +462,33 @@ def query_vector(prompt)
   sql_query_json("SELECT id, type, content, created_at FROM entries WHERE id IN (#{ids});")
 end
 
+def format_date(datetime_str)
+  return nil if datetime_str.nil? || datetime_str.empty?
+  datetime_str[0, 10] # YYYY-MM-DD from "YYYY-MM-DD HH:MM:SS"
+rescue
+  nil
+end
+
 def format_triples(triples)
   return '' if triples.empty?
-  lines = triples.map do |t|
-    validity = t['valid_until'] ? " (until #{t['valid_until']})" : ''
-    "- #{t['subject']} → #{t['predicate']} → #{t['object']}#{validity}"
+  sorted = triples.sort_by { |t| t['valid_from'] || '' }.reverse
+  lines = sorted.map do |t|
+    since = format_date(t['valid_from'])
+    since_str = since ? " (since #{since})" : ''
+    "- #{t['subject']} → #{t['predicate']} → #{t['object']}#{since_str}"
   end
   "## Known facts\n\n#{lines.join("\n")}"
 end
 
 def format_entries(entries)
   return '' if entries.empty?
-  sections = entries.map do |e|
-    "[#{e['type']}] #{e['content']}"
+  sorted = entries.sort_by { |e| e['created_at'] || '' }.reverse
+  lines = sorted.map do |e|
+    date = format_date(e['created_at'])
+    prefix = date ? "#{date} #{e['type']}" : e['type']
+    "- [#{prefix}] #{e['content']}"
   end
-  "## Memory entries\n\n#{sections.join("\n\n")}"
+  "## Memory entries\n\n#{lines.join("\n")}"
 end
 
 def rerank(prompt, combined_text)
@@ -534,7 +546,8 @@ def cmd_retrieve
   combined = rerank(prompt, combined) if combined.length > CHAR_BUDGET
   combined = truncate(combined, CHAR_BUDGET)
 
-  puts "<memory>\n#{combined}\n</memory>"
+  context_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+  puts "<memory context_time=\"#{context_time}\">\n#{combined}\n</memory>"
 end
 
 # ---------------------------------------------------------------------------
