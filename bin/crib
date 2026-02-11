@@ -1,13 +1,13 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# crib — automatic memory for Claude Code agents
+# crib — memory storage and retrieval for Claude Code agents
 # https://github.com/bioneural/crib
 # MIT License — Copyright (c) 2026 Fort Asset LLC
 #
 # A single-file memory system: fact triples, full-text search, and vector
-# embeddings in one SQLite database. Agents write structured and unstructured
-# memory; retrieval surfaces what's relevant on every prompt.
+# embeddings in one SQLite database. Write stores text and extracts triples.
+# Retrieve queries all channels and returns what's relevant for a given prompt.
 #
 # Subcommands:
 #

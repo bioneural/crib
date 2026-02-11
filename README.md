@@ -1,10 +1,10 @@
 <h1 align="center">
   c r i b
   <br>
-  <sub>automatic memory for Claude Code agents</sub>
+  <sub>memory storage and retrieval for Claude Code agents</sub>
 </h1>
 
-Agents forget between sessions. Decisions made yesterday are relitigated today. Context that shaped a choice evaporates before the next prompt arrives. Crib makes memory structural — one SQLite database with three query channels, automatic retrieval on every prompt, and consolidation-on-write so the archive stays clean.
+Agents forget between sessions. Decisions made yesterday are relitigated today. Context that shaped a choice evaporates before the next prompt arrives. Crib is the storage layer that solves this — one SQLite database with three query channels, consolidation-on-write so the archive stays clean, and a retrieval command that surfaces what's relevant for a given prompt.
 
 A single script. No gems. No external services. No API keys.
 
