@@ -22,7 +22,7 @@ Crib stores memory in an SQLite database with three query channels:
 
 ### Fact triples
 
-A fact triple represents a single relationship between two things: `(subject, predicate, object)`. The sentence "We chose SQLite for storage" becomes the triple `(SQLite, storage_backend, prophet)`. The sentence "ClientA pays Net30" becomes `(ClientA, payment_terms, Net30)`.
+A fact triple represents a single relationship between two things: `(subject, predicate, object)`. The sentence "We chose SQLite for storage" becomes the triple `(SQLite, storage_backend, project)`. The sentence "ClientA pays Net30" becomes `(ClientA, payment_terms, Net30)`.
 
 Triples are precise where full-text search is fuzzy. Ask "what are ClientA's terms?" and a keyword search has to hope the right document surfaces. A triple query walks directly from the entity `ClientA` through the predicate `payment_terms` to the answer `Net30` — one SQL JOIN, no ranking, no ambiguity.
 
