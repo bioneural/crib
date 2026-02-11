@@ -14,14 +14,14 @@
 #   crib write     Store text and extracted fact triples
 #   crib retrieve  Query memory and return relevant context
 #   crib init      Initialize the database (run automatically on first write)
-#   crib schema    Print the database schema
+#   crib doctor    Check all prerequisites and report status (JSON on stdout)
 #
 # Usage:
 #   echo "Chose SQLite for storage" | bin/crib write
 #   echo "type=decision Chose SQLite" | bin/crib write
 #   echo "what database did we choose?" | bin/crib retrieve
 #   bin/crib init
-#   bin/crib schema
+#   bin/crib doctor
 #
 # Environment:
 #   CRIB_DB    Path to the SQLite database file.
@@ -31,9 +31,8 @@
 #   write     — status on stderr, nothing on stdout
 #   retrieve  — <memory>...</memory> on stdout (empty = nothing relevant)
 #   init      — status on stderr
-#   schema    — SQL on stdout
 #
-# Dependencies: ruby (stdlib only), sqlite3 (CLI), ollama
+# Dependencies: ruby (stdlib only), sqlite3 (CLI), sqlite-vec (extension), ollama
 #
 # Behavior:
 #   write:
@@ -43,7 +42,7 @@
 #     4. Store entry with FTS5 indexing
 #     5. Extract fact triples via ollama
 #     6. Store entities and relations (consolidation-on-write: supersedes stale facts)
-#     7. Generate embedding via ollama (deferred until sqlite-vec available)
+#     7. Generate embedding via ollama and store in vec0 table
 #
 #   retrieve:
 #     1. Read prompt from stdin
@@ -54,10 +53,12 @@
 #     6. Wrap in <memory> tags and output to stdout
 #     7. Exit 0 always (fail-open)
 #
-# Schema: see `bin/crib schema` or the SCHEMA constant below.
+# Schema: see the SCHEMA constant below or the README.
 
 require 'json'
 require 'open3'
+require 'net/http'
+require 'uri'
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -67,6 +68,21 @@ DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, 'memory', 'crib.db') }
 EMBEDDING_MODEL = ENV.fetch('CRIB_EMBEDDING_MODEL', 'nomic-embed-text')
 EXTRACTION_MODEL = ENV.fetch('CRIB_EXTRACTION_MODEL', 'gemma3:1b')
 RERANK_MODEL = ENV.fetch('CRIB_RERANK_MODEL', 'gemma3:1b')
+OLLAMA_HOST = ENV.fetch('OLLAMA_HOST', 'http://localhost:11434')
+EMBEDDING_DIM = 768 # nomic-embed-text output dimension
+
+# sqlite3 binary: macOS system sqlite3 has extension loading disabled.
+# Homebrew's sqlite3 supports .load. Auto-detect or override via env var.
+SQLITE3 = ENV.fetch('CRIB_SQLITE3') {
+  brew_path = '/opt/homebrew/opt/sqlite/bin/sqlite3'
+  File.executable?(brew_path) ? brew_path : 'sqlite3'
+}
+
+# sqlite-vec extension: auto-detect via Python package or override via env var.
+VEC_EXTENSION = ENV.fetch('CRIB_VEC_EXTENSION') {
+  detected, status = Open3.capture2('python3', '-c', 'import sqlite_vec; print(sqlite_vec.loadable_path())')
+  status.success? ? detected.strip : 'vec0'
+}
 TOKEN_BUDGET = 2000
 CHAR_BUDGET = TOKEN_BUDGET * 4
 
@@ -130,6 +146,13 @@ SCHEMA = <<~SQL
   END;
 SQL
 
+# Vec0 table must be created separately because it requires the sqlite-vec extension
+VEC_SCHEMA = <<~SQL
+  CREATE VIRTUAL TABLE IF NOT EXISTS entries_vec USING vec0(
+    embedding float[#{EMBEDDING_DIM}]
+  );
+SQL
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -139,7 +162,7 @@ def escape_sql(str)
 end
 
 def sql_exec(query)
-  stdout, stderr, status = Open3.capture3('sqlite3', DB_PATH, stdin_data: query)
+  stdout, stderr, status = Open3.capture3(SQLITE3, DB_PATH, stdin_data: query)
   unless status.success?
     $stderr.puts "crib: sqlite3 error: #{stderr.strip}"
     return nil
@@ -148,9 +171,37 @@ def sql_exec(query)
 end
 
 def sql_query_json(query)
-  stdout, stderr, status = Open3.capture3('sqlite3', '-json', DB_PATH, stdin_data: query)
+  stdout, stderr, status = Open3.capture3(SQLITE3, '-json', DB_PATH, stdin_data: query)
   unless status.success?
     $stderr.puts "crib: sqlite3 error: #{stderr.strip}"
+    return []
+  end
+  return [] if stdout.strip.empty?
+  JSON.parse(stdout)
+rescue JSON::ParserError => e
+  $stderr.puts "crib: JSON parse error: #{e.message}"
+  []
+end
+
+def sql_exec_vec(query)
+  stdout, stderr, status = Open3.capture3(
+    SQLITE3, '-cmd', ".load #{VEC_EXTENSION}", DB_PATH,
+    stdin_data: query
+  )
+  unless status.success?
+    $stderr.puts "crib: sqlite3+vec error: #{stderr.strip}"
+    return nil
+  end
+  stdout.strip
+end
+
+def sql_query_json_vec(query)
+  stdout, stderr, status = Open3.capture3(
+    SQLITE3, '-json', '-cmd', ".load #{VEC_EXTENSION}", DB_PATH,
+    stdin_data: query
+  )
+  unless status.success?
+    $stderr.puts "crib: sqlite3+vec error: #{stderr.strip}"
     return []
   end
   return [] if stdout.strip.empty?
@@ -187,6 +238,32 @@ end
 def init_db
   ensure_db_dir
   sql_exec(SCHEMA)
+  sql_exec_vec(VEC_SCHEMA)
+end
+
+def ollama_embed(text)
+  uri = URI("#{OLLAMA_HOST}/api/embed")
+  req = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
+  req.body = JSON.generate({ model: EMBEDDING_MODEL, input: text })
+
+  response = Net::HTTP.start(uri.hostname, uri.port) do |http|
+    http.read_timeout = 30
+    http.request(req)
+  end
+
+  unless response.is_a?(Net::HTTPSuccess)
+    $stderr.puts "crib: ollama embed error: HTTP #{response.code}"
+    return nil
+  end
+
+  data = JSON.parse(response.body)
+  data['embeddings']&.first
+rescue Errno::ECONNREFUSED
+  $stderr.puts 'crib: ollama not running (connection refused)'
+  nil
+rescue => e
+  $stderr.puts "crib: ollama embed failed: #{e.message}"
+  nil
 end
 
 # ---------------------------------------------------------------------------
@@ -194,8 +271,10 @@ end
 # ---------------------------------------------------------------------------
 
 def store_entry(type, content)
-  sql_exec("INSERT INTO entries(type, content) VALUES ('#{escape_sql(type)}', '#{escape_sql(content)}');")
-  result = sql_exec("SELECT last_insert_rowid();")
+  result = sql_exec(<<~SQL)
+    INSERT INTO entries(type, content) VALUES ('#{escape_sql(type)}', '#{escape_sql(content)}');
+    SELECT last_insert_rowid();
+  SQL
   result&.to_i
 end
 
@@ -225,11 +304,12 @@ end
 
 def find_or_create_entity(name, type)
   existing = sql_query_json("SELECT id FROM entities WHERE name = '#{escape_sql(name)}' LIMIT 1;")
-  unless existing.empty?
-    return existing.first['id']
-  end
-  sql_exec("INSERT INTO entities(name, type) VALUES ('#{escape_sql(name)}', '#{escape_sql(type)}');")
-  result = sql_exec("SELECT last_insert_rowid();")
+  return existing.first['id'] unless existing.empty?
+
+  result = sql_exec(<<~SQL)
+    INSERT INTO entities(name, type) VALUES ('#{escape_sql(name)}', '#{escape_sql(type)}');
+    SELECT last_insert_rowid();
+  SQL
   result&.to_i
 end
 
@@ -246,27 +326,24 @@ def store_triple(subject_name, subject_type, predicate, object_name, object_type
       AND valid_until IS NULL;
   SQL
 
-  sql_exec(<<~SQL)
+  relation_id = sql_exec(<<~SQL)&.to_i
     INSERT INTO relations(subject_id, predicate, object_id)
     VALUES (#{subject_id}, '#{escape_sql(predicate)}', #{object_id});
+    SELECT last_insert_rowid();
   SQL
-
-  relation_id = sql_exec("SELECT last_insert_rowid();")&.to_i
   return if relation_id.nil?
 
-  sql_exec(<<~SQL)
-    INSERT INTO sources(relation_id, raw_text)
-    VALUES (#{relation_id}, '#{escape_sql(raw_text)}');
-  SQL
+  sql_exec("INSERT INTO sources(relation_id, raw_text) VALUES (#{relation_id}, '#{escape_sql(raw_text)}');")
 end
 
-def generate_embedding(_text)
-  # TODO: implement via curl to ollama API when sqlite-vec is available
-  nil
+def generate_embedding(text)
+  ollama_embed(text)
 end
 
-def store_embedding(_entry_id, _embedding)
-  # TODO: store embedding blob when sqlite-vec is available
+def store_embedding(entry_id, embedding)
+  return if embedding.nil? || entry_id.nil?
+  json_vec = JSON.generate(embedding)
+  sql_exec_vec("INSERT INTO entries_vec(rowid, embedding) VALUES (#{entry_id}, '#{escape_sql(json_vec)}');")
 end
 
 def cmd_write
@@ -366,9 +443,23 @@ def query_fts(keywords)
   SQL
 end
 
-def query_vector(_prompt)
-  # TODO: implement when sqlite-vec is available
-  []
+def query_vector(prompt)
+  embedding = ollama_embed(prompt)
+  return [] if embedding.nil?
+
+  json_vec = JSON.generate(embedding)
+  results = sql_query_json_vec(<<~SQL)
+    SELECT rowid, distance
+    FROM entries_vec
+    WHERE embedding MATCH '#{escape_sql(json_vec)}'
+    ORDER BY distance
+    LIMIT 10;
+  SQL
+
+  return [] if results.empty?
+
+  ids = results.map { |r| r['rowid'] }.join(',')
+  sql_query_json("SELECT id, type, content, created_at FROM entries WHERE id IN (#{ids});")
 end
 
 def format_triples(triples)
@@ -451,19 +542,74 @@ end
 # ---------------------------------------------------------------------------
 
 def cmd_init
-  if db_exists?
-    $stderr.puts "crib: database already exists at #{DB_PATH}"
-    # Run schema anyway to apply any new tables/triggers
-    init_db
-    $stderr.puts 'crib: schema applied'
-  else
-    init_db
-    $stderr.puts "crib: initialized #{DB_PATH}"
-  end
+  init_db
+  $stderr.puts "crib: initialized #{DB_PATH}"
 end
 
-def cmd_schema
-  puts SCHEMA
+def cmd_doctor
+  report = {}
+
+  # Ruby
+  report['ruby'] = { 'version' => RUBY_VERSION, 'ok' => true }
+
+  # sqlite3 binary
+  sqlite_out, sqlite_status = Open3.capture2(SQLITE3, '--version')
+  report['sqlite3'] = {
+    'path' => SQLITE3,
+    'version' => sqlite_status.success? ? sqlite_out.strip.split.first : nil,
+    'ok' => sqlite_status.success?
+  }
+
+  # sqlite-vec extension
+  vec_out, vec_status = Open3.capture2(
+    SQLITE3, '-cmd', ".load #{VEC_EXTENSION}", ':memory:',
+    stdin_data: 'SELECT vec_version();'
+  )
+  report['sqlite_vec'] = {
+    'path' => VEC_EXTENSION,
+    'version' => vec_status.success? ? vec_out.strip : nil,
+    'ok' => vec_status.success?
+  }
+
+  # ollama
+  ollama_out, ollama_status = Open3.capture2('ollama', '--version')
+  report['ollama'] = {
+    'version' => ollama_status.success? ? ollama_out.strip : nil,
+    'ok' => ollama_status.success?
+  }
+
+  # ollama reachable
+  begin
+    uri = URI("#{OLLAMA_HOST}/api/tags")
+    response = Net::HTTP.get_response(uri)
+    models = []
+    if response.is_a?(Net::HTTPSuccess)
+      data = JSON.parse(response.body)
+      models = (data['models'] || []).map { |m| m['name'] }
+    end
+    report['ollama_api'] = { 'host' => OLLAMA_HOST, 'ok' => response.is_a?(Net::HTTPSuccess) }
+  rescue => e
+    report['ollama_api'] = { 'host' => OLLAMA_HOST, 'ok' => false, 'error' => e.message }
+    models = []
+  end
+
+  # Models
+  [EXTRACTION_MODEL, RERANK_MODEL, EMBEDDING_MODEL].uniq.each do |model|
+    present = models.any? { |m| m.start_with?(model) }
+    report["model:#{model}"] = { 'ok' => present }
+  end
+
+  # Database
+  report['database'] = {
+    'path' => DB_PATH,
+    'exists' => File.exist?(DB_PATH)
+  }
+
+  # Overall
+  report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
+
+  puts JSON.pretty_generate(report)
+  exit(report['ok'] ? 0 : 1)
 end
 
 # ---------------------------------------------------------------------------
@@ -478,7 +624,7 @@ def usage
       write     Store text and extracted fact triples (stdin)
       retrieve  Query memory for relevant context (stdin)
       init      Initialize the database
-      schema    Print the database schema
+      doctor    Check prerequisites and report status (JSON)
 
     Environment:
       CRIB_DB   Path to SQLite database (default: memory/crib.db)
@@ -491,6 +637,6 @@ case command
 when 'write'    then cmd_write
 when 'retrieve' then cmd_retrieve
 when 'init'     then cmd_init
-when 'schema'   then cmd_schema
+when 'doctor'   then cmd_doctor
 else usage
 end

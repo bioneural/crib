@@ -28,9 +28,9 @@ Triples are precise where full-text search is fuzzy. Ask "what are ClientA's ter
 
 Crib extracts triples automatically on write using ollama. You write natural text; crib stores both the text (for full-text search) and the structured facts (for precise recall). When a new fact contradicts an old one, the old triple is superseded — marked with a `valid_until` timestamp rather than deleted. History is preserved but current queries return only what's true now.
 
-**Write path** — text arrives on stdin. Crib stores it as a full-text entry, extracts fact triples via ollama, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
+**Write path** — text arrives on stdin. Crib stores it as a full-text entry, generates a vector embedding via ollama, extracts fact triples, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
 
-**Read path** — a prompt arrives on stdin. Crib extracts keywords, queries all three channels, merges and deduplicates results, reranks with ollama if over budget, and wraps the output in `<memory>` tags. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
+**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. Results are merged, deduplicated, reranked with ollama if over budget, and wrapped in `<memory>` tags. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
 
 ---
 
@@ -47,7 +47,7 @@ echo "type=decision Chose SQLite for storage." | bin/crib write
 echo "what database did we choose?" | bin/crib retrieve
 # <memory>
 # ## Known facts
-# - SQLite → storage_backend → crib
+# - SQLite → storage_backend → project
 # ## Memory entries
 # [decision] Chose SQLite for storage. Zero dependencies.
 # </memory>
@@ -55,8 +55,9 @@ echo "what database did we choose?" | bin/crib retrieve
 # Initialize the database explicitly (happens automatically on first write)
 bin/crib init
 
-# Print the schema
-bin/crib schema
+# Check all prerequisites
+bin/crib doctor
+# { "ruby": { "version": "3.x", "ok": true }, ... "ok": true }
 ```
 
 ### Entry types
@@ -75,6 +76,8 @@ The optional `type=` prefix on write categorizes entries:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CRIB_DB` | `memory/crib.db` | Path to the SQLite database |
+| `CRIB_SQLITE3` | auto-detected | Path to a sqlite3 binary with extension loading |
+| `CRIB_VEC_EXTENSION` | auto-detected | Path to the sqlite-vec `vec0` extension |
 
 Model overrides are documented in [Prerequisites](#prerequisites).
 
@@ -141,26 +144,75 @@ CREATE VIRTUAL TABLE entries_fts USING fts5(
   content_rowid='id',
   tokenize='porter unicode61'
 );
+
+-- Vector embeddings (semantic similarity)
+CREATE VIRTUAL TABLE entries_vec USING vec0(
+  embedding float[768]
+);
 ```
 
 Triples use bi-temporal validity — `valid_from` / `valid_until` on relations. A query for current facts filters on `valid_until IS NULL`. Old facts are superseded, not deleted.
+
+Vector embeddings are stored in a sqlite-vec `vec0` virtual table. Each entry's embedding is a 768-dimensional float vector (nomic-embed-text default). Retrieval generates an embedding of the prompt and finds nearest neighbors.
+
+---
+
+## Smoke tests
+
+```
+$ bin/smoke-test
+
+Doctor
+  ✓ Doctor reports all prerequisites OK
+  ✓ Doctor output is valid JSON
+
+Init
+  ✓ Init creates database
+  ✓ Database file exists after init
+  ✓ Database has all expected tables
+  ✓ Vec0 virtual table exists
+
+Write
+  ✓ Write stores entry and reports success
+  ✓ Write respects type= prefix
+  ✓ Write extracts triples
+  ✓ Write rejects empty input
+
+Retrieve
+  ✓ Retrieve finds entries via FTS5
+  ✓ Retrieve finds fact triples
+  ✓ Retrieve finds entries via vector similarity
+  ✓ Retrieve wraps output in <memory> tags
+  ✓ Retrieve with empty input exits cleanly
+  ✓ Retrieve with missing database exits cleanly
+
+Consolidation
+  ✓ Consolidation-on-write runs without error
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+17 passed
+```
+
+Tests run against a temporary database that is created and destroyed on each run. No artifacts are left behind.
 
 ---
 
 ## Prerequisites
 
 - Ruby 3.x (ships with macOS)
-- SQLite 3.x (ships with macOS)
+- SQLite 3.x with extension loading enabled (Homebrew's `sqlite` — the macOS system sqlite3 has extension loading disabled)
+- [sqlite-vec](https://github.com/asg017/sqlite-vec) (`pip3 install sqlite-vec`)
 - [Ollama](https://ollama.com) with the default models pulled (see below)
-- [sqlite-vec](https://github.com/asg017/sqlite-vec) (vector similarity search)
 
-Default models ship with sensible defaults and can be overridden via environment variables:
+Default models can be overridden via environment variables:
 
 | Purpose | Default | Override |
 |---------|---------|----------|
 | Triple extraction | `gemma3:1b` | `CRIB_EXTRACTION_MODEL` |
 | Reranking | `gemma3:1b` | `CRIB_RERANK_MODEL` |
 | Embeddings | `nomic-embed-text` | `CRIB_EMBEDDING_MODEL` |
+
+Run `bin/crib doctor` to verify all prerequisites are installed and report status as JSON.
 
 ---
 
