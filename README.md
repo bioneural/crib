@@ -152,9 +152,8 @@ Triples use bi-temporal validity — `valid_from` / `valid_until` on relations. 
 
 - Ruby 3.x (ships with macOS)
 - SQLite 3.x (ships with macOS)
-- [Ollama](https://ollama.com) with `gemma3:1b` pulled (for triple extraction and reranking)
-
-Vector embeddings require `nomic-embed-text` pulled and sqlite-vec loaded. Without sqlite-vec, the vector channel is skipped and the other two channels still function.
+- [Ollama](https://ollama.com) with `gemma3:1b` pulled (triple extraction and reranking) and `nomic-embed-text` pulled (embeddings)
+- [sqlite-vec](https://github.com/asg017/sqlite-vec) (vector similarity search)
 
 ---
 
