@@ -75,9 +75,8 @@ The optional `type=` prefix on write categorizes entries:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CRIB_DB` | `memory/crib.db` | Path to the SQLite database |
-| `CRIB_EXTRACTION_MODEL` | `gemma3:1b` | Ollama model for triple extraction |
-| `CRIB_RERANK_MODEL` | `gemma3:1b` | Ollama model for reranking |
-| `CRIB_EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model for embeddings |
+
+Model overrides are documented in [Prerequisites](#prerequisites).
 
 ---
 
@@ -152,8 +151,16 @@ Triples use bi-temporal validity — `valid_from` / `valid_until` on relations. 
 
 - Ruby 3.x (ships with macOS)
 - SQLite 3.x (ships with macOS)
-- [Ollama](https://ollama.com) with `gemma3:1b` pulled (triple extraction and reranking) and `nomic-embed-text` pulled (embeddings)
+- [Ollama](https://ollama.com) with the default models pulled (see below)
 - [sqlite-vec](https://github.com/asg017/sqlite-vec) (vector similarity search)
+
+Default models ship with sensible defaults and can be overridden via environment variables:
+
+| Purpose | Default | Override |
+|---------|---------|----------|
+| Triple extraction | `gemma3:1b` | `CRIB_EXTRACTION_MODEL` |
+| Reranking | `gemma3:1b` | `CRIB_RERANK_MODEL` |
+| Embeddings | `nomic-embed-text` | `CRIB_EMBEDDING_MODEL` |
 
 ---
 
