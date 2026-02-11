@@ -1,0 +1,496 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# crib — automatic memory for Claude Code agents
+# https://github.com/bioneural/crib
+# MIT License — Copyright (c) 2026 Fort Asset LLC
+#
+# A single-file memory system: fact triples, full-text search, and vector
+# embeddings in one SQLite database. Agents write structured and unstructured
+# memory; retrieval surfaces what's relevant on every prompt.
+#
+# Subcommands:
+#
+#   crib write     Store text and extracted fact triples
+#   crib retrieve  Query memory and return relevant context
+#   crib init      Initialize the database (run automatically on first write)
+#   crib schema    Print the database schema
+#
+# Usage:
+#   echo "Chose SQLite for storage" | bin/crib write
+#   echo "type=decision Chose SQLite" | bin/crib write
+#   echo "what database did we choose?" | bin/crib retrieve
+#   bin/crib init
+#   bin/crib schema
+#
+# Environment:
+#   CRIB_DB    Path to the SQLite database file.
+#              Default: memory/crib.db (relative to cwd)
+#
+# Output:
+#   write     — status on stderr, nothing on stdout
+#   retrieve  — <memory>...</memory> on stdout (empty = nothing relevant)
+#   init      — status on stderr
+#   schema    — SQL on stdout
+#
+# Dependencies: ruby (stdlib only), sqlite3 (CLI), ollama
+#
+# Behavior:
+#   write:
+#     1. Read text from stdin
+#     2. Parse optional type= prefix (decision, correction, note, error)
+#     3. Initialize database if needed
+#     4. Store entry with FTS5 indexing
+#     5. Extract fact triples via ollama
+#     6. Store entities and relations (consolidation-on-write: supersedes stale facts)
+#     7. Generate embedding via ollama (deferred until sqlite-vec available)
+#
+#   retrieve:
+#     1. Read prompt from stdin
+#     2. Extract keywords
+#     3. Query three channels: triples (SQL), full-text (FTS5), vectors (sqlite-vec)
+#     4. Merge and deduplicate
+#     5. Rerank with ollama if over token budget
+#     6. Wrap in <memory> tags and output to stdout
+#     7. Exit 0 always (fail-open)
+#
+# Schema: see `bin/crib schema` or the SCHEMA constant below.
+
+require 'json'
+require 'open3'
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, 'memory', 'crib.db') }
+EMBEDDING_MODEL = ENV.fetch('CRIB_EMBEDDING_MODEL', 'nomic-embed-text')
+EXTRACTION_MODEL = ENV.fetch('CRIB_EXTRACTION_MODEL', 'gemma3:1b')
+RERANK_MODEL = ENV.fetch('CRIB_RERANK_MODEL', 'gemma3:1b')
+TOKEN_BUDGET = 2000
+CHAR_BUDGET = TOKEN_BUDGET * 4
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+SCHEMA = <<~SQL
+  -- Fact triples (structured recall)
+  CREATE TABLE IF NOT EXISTS entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id INTEGER NOT NULL REFERENCES entities(id),
+    predicate TEXT NOT NULL,
+    object_id INTEGER NOT NULL REFERENCES entities(id),
+    valid_from TEXT DEFAULT (datetime('now')),
+    valid_until TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    relation_id INTEGER NOT NULL REFERENCES relations(id),
+    raw_text TEXT NOT NULL,
+    timestamp TEXT DEFAULT (datetime('now'))
+  );
+
+  -- Full-text entries (unstructured recall)
+  CREATE TABLE IF NOT EXISTS entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    embedding BLOB,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+    content,
+    content='entries',
+    content_rowid='id',
+    tokenize='porter unicode61'
+  );
+
+  CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+    INSERT INTO entries_fts(rowid, content) VALUES (new.id, new.content);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, content) VALUES('delete', old.id, old.content);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO entries_fts(rowid, content) VALUES (new.id, new.content);
+  END;
+SQL
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def escape_sql(str)
+  str.gsub("'", "''")
+end
+
+def sql_exec(query)
+  stdout, stderr, status = Open3.capture3('sqlite3', DB_PATH, stdin_data: query)
+  unless status.success?
+    $stderr.puts "crib: sqlite3 error: #{stderr.strip}"
+    return nil
+  end
+  stdout.strip
+end
+
+def sql_query_json(query)
+  stdout, stderr, status = Open3.capture3('sqlite3', '-json', DB_PATH, stdin_data: query)
+  unless status.success?
+    $stderr.puts "crib: sqlite3 error: #{stderr.strip}"
+    return []
+  end
+  return [] if stdout.strip.empty?
+  JSON.parse(stdout)
+rescue JSON::ParserError => e
+  $stderr.puts "crib: JSON parse error: #{e.message}"
+  []
+end
+
+def call_ollama(prompt, model)
+  stdout, stderr, status = Open3.capture3('ollama', 'run', model, stdin_data: prompt)
+  unless status.success?
+    $stderr.puts "crib: ollama error (#{model}): #{stderr.strip}"
+    return nil
+  end
+  stdout.strip
+rescue Errno::ENOENT
+  $stderr.puts 'crib: ollama not found'
+  nil
+rescue => e
+  $stderr.puts "crib: ollama failed: #{e.message}"
+  nil
+end
+
+def db_exists?
+  File.exist?(DB_PATH)
+end
+
+def ensure_db_dir
+  dir = File.dirname(DB_PATH)
+  Dir.mkdir(dir) unless Dir.exist?(dir)
+end
+
+def init_db
+  ensure_db_dir
+  sql_exec(SCHEMA)
+end
+
+# ---------------------------------------------------------------------------
+# Write
+# ---------------------------------------------------------------------------
+
+def store_entry(type, content)
+  sql_exec("INSERT INTO entries(type, content) VALUES ('#{escape_sql(type)}', '#{escape_sql(content)}');")
+  result = sql_exec("SELECT last_insert_rowid();")
+  result&.to_i
+end
+
+def extract_triples(text)
+  prompt = <<~PROMPT
+    Extract factual relationships from the following text as JSON.
+    Return a JSON array of objects, each with "subject", "predicate", "object", and "subject_type", "object_type" fields.
+    Subject and object are entity names. Predicate is the relationship.
+    Types are short categories like: person, project, tool, concept, decision, date, value.
+    If no clear facts can be extracted, return an empty array: []
+    Return ONLY valid JSON. No explanation.
+
+    Text: #{text}
+  PROMPT
+
+  result = call_ollama(prompt, EXTRACTION_MODEL)
+  return [] if result.nil? || result.empty?
+
+  json_str = result[/\[.*\]/m]
+  return [] if json_str.nil?
+
+  JSON.parse(json_str)
+rescue JSON::ParserError
+  $stderr.puts 'crib: failed to parse triple extraction response'
+  []
+end
+
+def find_or_create_entity(name, type)
+  existing = sql_query_json("SELECT id FROM entities WHERE name = '#{escape_sql(name)}' LIMIT 1;")
+  unless existing.empty?
+    return existing.first['id']
+  end
+  sql_exec("INSERT INTO entities(name, type) VALUES ('#{escape_sql(name)}', '#{escape_sql(type)}');")
+  result = sql_exec("SELECT last_insert_rowid();")
+  result&.to_i
+end
+
+def store_triple(subject_name, subject_type, predicate, object_name, object_type, raw_text)
+  subject_id = find_or_create_entity(subject_name, subject_type)
+  object_id = find_or_create_entity(object_name, object_type)
+  return if subject_id.nil? || object_id.nil?
+
+  # Consolidation: supersede existing relations with same subject+predicate
+  sql_exec(<<~SQL)
+    UPDATE relations SET valid_until = datetime('now')
+    WHERE subject_id = #{subject_id}
+      AND predicate = '#{escape_sql(predicate)}'
+      AND valid_until IS NULL;
+  SQL
+
+  sql_exec(<<~SQL)
+    INSERT INTO relations(subject_id, predicate, object_id)
+    VALUES (#{subject_id}, '#{escape_sql(predicate)}', #{object_id});
+  SQL
+
+  relation_id = sql_exec("SELECT last_insert_rowid();")&.to_i
+  return if relation_id.nil?
+
+  sql_exec(<<~SQL)
+    INSERT INTO sources(relation_id, raw_text)
+    VALUES (#{relation_id}, '#{escape_sql(raw_text)}');
+  SQL
+end
+
+def generate_embedding(_text)
+  # TODO: implement via curl to ollama API when sqlite-vec is available
+  nil
+end
+
+def store_embedding(_entry_id, _embedding)
+  # TODO: store embedding blob when sqlite-vec is available
+end
+
+def cmd_write
+  text = $stdin.read
+  if text.nil? || text.strip.empty?
+    $stderr.puts 'crib: empty input'
+    exit 1
+  end
+  text = text.strip
+
+  # Parse optional type prefix
+  type = 'note'
+  if text.match?(/\Atype=\w+\s/)
+    type = text[/\Atype=(\w+)/, 1]
+    text = text.sub(/\Atype=\w+\s+/, '')
+  end
+
+  init_db
+
+  entry_id = store_entry(type, text)
+  if entry_id.nil?
+    $stderr.puts 'crib: failed to store entry'
+    exit 1
+  end
+
+  triples = extract_triples(text)
+  triples.each do |triple|
+    store_triple(
+      triple['subject'] || 'unknown',
+      triple['subject_type'] || 'concept',
+      triple['predicate'] || 'related_to',
+      triple['object'] || 'unknown',
+      triple['object_type'] || 'concept',
+      text
+    )
+  end
+
+  embedding = generate_embedding(text)
+  store_embedding(entry_id, embedding)
+
+  $stderr.puts "crib: stored entry ##{entry_id} (#{type}), #{triples.length} triples extracted"
+end
+
+# ---------------------------------------------------------------------------
+# Retrieve
+# ---------------------------------------------------------------------------
+
+STOP_WORDS = %w[a an the is are was were be been being have has had do does did
+                will would shall should may might can could of in to for on with
+                at by from as into about between through during before after
+                and or but not no nor so yet both either neither each every all
+                any few more most other some such this that these those
+                i me my we our you your he him his she her it its they them their
+                what which who whom how when where why if then else
+                just also very too quite rather really].freeze
+
+def extract_keywords(prompt)
+  words = prompt.downcase.gsub(/[^\w\s]/, '').split
+  words.reject { |w| w.length < 3 || STOP_WORDS.include?(w) }.uniq
+end
+
+def query_triples(keywords)
+  return [] if keywords.empty?
+
+  like_clauses = keywords.map { |k| "name LIKE '%#{escape_sql(k)}%'" }.join(' OR ')
+
+  sql_query_json(<<~SQL)
+    SELECT
+      s.name AS subject,
+      r.predicate,
+      o.name AS object,
+      r.valid_from,
+      r.valid_until
+    FROM relations r
+    JOIN entities s ON r.subject_id = s.id
+    JOIN entities o ON r.object_id = o.id
+    WHERE r.valid_until IS NULL
+      AND (s.id IN (SELECT id FROM entities WHERE #{like_clauses})
+           OR o.id IN (SELECT id FROM entities WHERE #{like_clauses}))
+    ORDER BY r.created_at DESC
+    LIMIT 20;
+  SQL
+end
+
+def query_fts(keywords)
+  return [] if keywords.empty?
+
+  fts_query = keywords.join(' OR ')
+
+  sql_query_json(<<~SQL)
+    SELECT e.id, e.type, e.content, e.created_at
+    FROM entries e
+    JOIN entries_fts f ON e.id = f.rowid
+    WHERE entries_fts MATCH '#{escape_sql(fts_query)}'
+    ORDER BY rank
+    LIMIT 10;
+  SQL
+end
+
+def query_vector(_prompt)
+  # TODO: implement when sqlite-vec is available
+  []
+end
+
+def format_triples(triples)
+  return '' if triples.empty?
+  lines = triples.map do |t|
+    validity = t['valid_until'] ? " (until #{t['valid_until']})" : ''
+    "- #{t['subject']} → #{t['predicate']} → #{t['object']}#{validity}"
+  end
+  "## Known facts\n\n#{lines.join("\n")}"
+end
+
+def format_entries(entries)
+  return '' if entries.empty?
+  sections = entries.map do |e|
+    "[#{e['type']}] #{e['content']}"
+  end
+  "## Memory entries\n\n#{sections.join("\n\n")}"
+end
+
+def rerank(prompt, combined_text)
+  return combined_text if combined_text.length <= CHAR_BUDGET
+
+  rerank_prompt = <<~PROMPT
+    Given this user prompt and a set of memory entries, select and return only
+    the most relevant entries that would help answer the prompt. Stay within
+    #{TOKEN_BUDGET} tokens. Return only the selected entries, no explanation.
+
+    Prompt: #{prompt}
+
+    Entries:
+    #{combined_text}
+  PROMPT
+
+  stdout, status = Open3.capture2('ollama', 'run', RERANK_MODEL, stdin_data: rerank_prompt)
+  return combined_text unless status.success?
+  result = stdout.strip
+  result.empty? ? combined_text : result
+rescue Errno::ENOENT
+  $stderr.puts 'crib: ollama not found, skipping rerank'
+  combined_text
+rescue => e
+  $stderr.puts "crib: rerank failed: #{e.message}"
+  combined_text
+end
+
+def truncate(text, max_chars)
+  return text if text.length <= max_chars
+  text[0, max_chars] + "\n\n[truncated — #{TOKEN_BUDGET} token budget exceeded]"
+end
+
+def cmd_retrieve
+  prompt = $stdin.read
+  exit 0 if prompt.nil? || prompt.strip.empty?
+  exit 0 unless db_exists?
+  prompt = prompt.strip
+
+  keywords = extract_keywords(prompt)
+  exit 0 if keywords.empty?
+
+  triples = query_triples(keywords)
+  entries = query_fts(keywords)
+  vector_entries = query_vector(prompt)
+
+  all_entries = (entries + vector_entries).uniq { |e| e['id'] }
+
+  triples_text = format_triples(triples)
+  entries_text = format_entries(all_entries)
+
+  combined = [triples_text, entries_text].reject(&:empty?).join("\n\n")
+  exit 0 if combined.empty?
+
+  combined = rerank(prompt, combined) if combined.length > CHAR_BUDGET
+  combined = truncate(combined, CHAR_BUDGET)
+
+  puts "<memory>\n#{combined}\n</memory>"
+end
+
+# ---------------------------------------------------------------------------
+# Init / Schema
+# ---------------------------------------------------------------------------
+
+def cmd_init
+  if db_exists?
+    $stderr.puts "crib: database already exists at #{DB_PATH}"
+    # Run schema anyway to apply any new tables/triggers
+    init_db
+    $stderr.puts 'crib: schema applied'
+  else
+    init_db
+    $stderr.puts "crib: initialized #{DB_PATH}"
+  end
+end
+
+def cmd_schema
+  puts SCHEMA
+end
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+def usage
+  $stderr.puts <<~USAGE
+    Usage: crib <command>
+
+    Commands:
+      write     Store text and extracted fact triples (stdin)
+      retrieve  Query memory for relevant context (stdin)
+      init      Initialize the database
+      schema    Print the database schema
+
+    Environment:
+      CRIB_DB   Path to SQLite database (default: memory/crib.db)
+  USAGE
+  exit 1
+end
+
+command = ARGV.shift
+case command
+when 'write'    then cmd_write
+when 'retrieve' then cmd_retrieve
+when 'init'     then cmd_init
+when 'schema'   then cmd_schema
+else usage
+end
