@@ -83,9 +83,9 @@ Model overrides are documented in [Prerequisites](#prerequisites).
 
 ---
 
-## Integration with hooker
+## Claude Code integration
 
-Crib is designed as a [hooker](https://github.com/bioneural/hooker) context command target. A policy wires retrieval to every prompt:
+Crib integrates with Claude Code via [hooker](https://github.com/bioneural/hooker), a policy engine for Claude Code hooks. A hooker policy wires retrieval to every prompt:
 
 ```ruby
 policy "Memory" do
@@ -99,6 +99,8 @@ Hooker pipes the user's prompt to stdin and injects stdout as additional context
 ```sh
 echo "type=decision Switched from Postgres to SQLite" | bin/crib write
 ```
+
+Crib's interface is stdin/stdout — any agent framework that can pipe text to a command can use it.
 
 ---
 
