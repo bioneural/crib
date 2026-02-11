@@ -20,6 +20,14 @@ Crib stores memory in an SQLite database with three query channels:
 | Full-text | FTS5 with Porter stemming | "What did we decide about caching?" |
 | Vector | sqlite-vec nearest neighbors | Semantic similarity when keywords fail |
 
+### Fact triples
+
+A fact triple represents a single relationship between two things: `(subject, predicate, object)`. The sentence "We chose SQLite for storage" becomes the triple `(SQLite, storage_backend, prophet)`. The sentence "ClientA pays Net30" becomes `(ClientA, payment_terms, Net30)`.
+
+Triples are precise where full-text search is fuzzy. Ask "what are ClientA's terms?" and a keyword search has to hope the right document surfaces. A triple query walks directly from the entity `ClientA` through the predicate `payment_terms` to the answer `Net30` — one SQL JOIN, no ranking, no ambiguity.
+
+Crib extracts triples automatically on write using ollama. You write natural text; crib stores both the text (for full-text search) and the structured facts (for precise recall). When a new fact contradicts an old one, the old triple is superseded — marked with a `valid_until` timestamp rather than deleted. History is preserved but current queries return only what's true now.
+
 **Write path** — text arrives on stdin. Crib stores it as a full-text entry, extracts fact triples via ollama, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
 
 **Read path** — a prompt arrives on stdin. Crib extracts keywords, queries all three channels, merges and deduplicates results, reranks with ollama if over budget, and wraps the output in `<memory>` tags. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
