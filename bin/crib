@@ -3,7 +3,7 @@
 
 # crib — memory storage and retrieval for AI agents
 # https://github.com/bioneural/crib
-# MIT License — Copyright (c) 2026 Fort Asset LLC
+# MIT License — Copyright (c) 2026 Kerry Ivan Kurian
 #
 # A single-file memory system: fact triples, full-text search, and vector
 # embeddings in one SQLite database. Write stores text and extracts triples.
@@ -524,8 +524,14 @@ def truncate(text, max_chars)
 end
 
 def cmd_retrieve
-  prompt = $stdin.read
-  exit 0 if prompt.nil? || prompt.strip.empty?
+  raw = $stdin.read
+  exit 0 if raw.nil? || raw.strip.empty?
+  parsed = JSON.parse(raw) rescue nil
+  prompt = if parsed.is_a?(Hash)
+             parsed['prompt'] || parsed.dig('tool_input', 'command') || raw
+           else
+             raw
+           end
   exit 0 unless db_exists?
   prompt = prompt.strip
 

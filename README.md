@@ -230,4 +230,4 @@ Run `bin/crib doctor` to verify all prerequisites are installed and report statu
 
 ## License
 
-MIT — Fort Asset LLC
+MIT — Kerry Ivan Kurian
