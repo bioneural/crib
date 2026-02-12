@@ -61,6 +61,12 @@ require 'net/http'
 require 'fileutils'
 require 'uri'
 
+SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
+if File.directory?(SPILL_HOME)
+  require File.join(SPILL_HOME, 'lib', 'spill')
+  Spill.configure(tool: 'crib')
+end
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -165,7 +171,7 @@ end
 def sql_exec(query)
   stdout, stderr, status = Open3.capture3(SQLITE3, DB_PATH, stdin_data: query)
   unless status.success?
-    $stderr.puts "crib: sqlite3 error: #{stderr.strip}"
+    defined?(Spill) ? Spill.error("sqlite3 error: #{stderr.strip}") : $stderr.puts("crib: sqlite3 error: #{stderr.strip}")
     return nil
   end
   stdout.strip
@@ -174,13 +180,13 @@ end
 def sql_query_json(query)
   stdout, stderr, status = Open3.capture3(SQLITE3, '-json', DB_PATH, stdin_data: query)
   unless status.success?
-    $stderr.puts "crib: sqlite3 error: #{stderr.strip}"
+    defined?(Spill) ? Spill.error("sqlite3 error: #{stderr.strip}") : $stderr.puts("crib: sqlite3 error: #{stderr.strip}")
     return []
   end
   return [] if stdout.strip.empty?
   JSON.parse(stdout)
 rescue JSON::ParserError => e
-  $stderr.puts "crib: JSON parse error: #{e.message}"
+  defined?(Spill) ? Spill.error("JSON parse error: #{e.message}") : $stderr.puts("crib: JSON parse error: #{e.message}")
   []
 end
 
@@ -190,7 +196,7 @@ def sql_exec_vec(query)
     stdin_data: query
   )
   unless status.success?
-    $stderr.puts "crib: sqlite3+vec error: #{stderr.strip}"
+    defined?(Spill) ? Spill.error("sqlite3+vec error: #{stderr.strip}") : $stderr.puts("crib: sqlite3+vec error: #{stderr.strip}")
     return nil
   end
   stdout.strip
@@ -202,28 +208,28 @@ def sql_query_json_vec(query)
     stdin_data: query
   )
   unless status.success?
-    $stderr.puts "crib: sqlite3+vec error: #{stderr.strip}"
+    defined?(Spill) ? Spill.error("sqlite3+vec error: #{stderr.strip}") : $stderr.puts("crib: sqlite3+vec error: #{stderr.strip}")
     return []
   end
   return [] if stdout.strip.empty?
   JSON.parse(stdout)
 rescue JSON::ParserError => e
-  $stderr.puts "crib: JSON parse error: #{e.message}"
+  defined?(Spill) ? Spill.error("JSON parse error: #{e.message}") : $stderr.puts("crib: JSON parse error: #{e.message}")
   []
 end
 
 def call_ollama(prompt, model)
   stdout, stderr, status = Open3.capture3('ollama', 'run', model, stdin_data: prompt)
   unless status.success?
-    $stderr.puts "crib: ollama error (#{model}): #{stderr.strip}"
+    defined?(Spill) ? Spill.error("ollama error (#{model}): #{stderr.strip}") : $stderr.puts("crib: ollama error (#{model}): #{stderr.strip}")
     return nil
   end
   stdout.strip
 rescue Errno::ENOENT
-  $stderr.puts 'crib: ollama not found'
+  defined?(Spill) ? Spill.warn('ollama not found') : $stderr.puts('crib: ollama not found')
   nil
 rescue => e
-  $stderr.puts "crib: ollama failed: #{e.message}"
+  defined?(Spill) ? Spill.error("ollama failed: #{e.message}") : $stderr.puts("crib: ollama failed: #{e.message}")
   nil
 end
 
@@ -253,17 +259,17 @@ def ollama_embed(text)
   end
 
   unless response.is_a?(Net::HTTPSuccess)
-    $stderr.puts "crib: ollama embed error: HTTP #{response.code}"
+    defined?(Spill) ? Spill.error("ollama embed error: HTTP #{response.code}") : $stderr.puts("crib: ollama embed error: HTTP #{response.code}")
     return nil
   end
 
   data = JSON.parse(response.body)
   data['embeddings']&.first
 rescue Errno::ECONNREFUSED
-  $stderr.puts 'crib: ollama not running (connection refused)'
+  defined?(Spill) ? Spill.warn('ollama not running (connection refused)') : $stderr.puts('crib: ollama not running (connection refused)')
   nil
 rescue => e
-  $stderr.puts "crib: ollama embed failed: #{e.message}"
+  defined?(Spill) ? Spill.error("ollama embed failed: #{e.message}") : $stderr.puts("crib: ollama embed failed: #{e.message}")
   nil
 end
 
@@ -299,7 +305,7 @@ def extract_triples(text)
 
   JSON.parse(json_str)
 rescue JSON::ParserError
-  $stderr.puts 'crib: failed to parse triple extraction response'
+  defined?(Spill) ? Spill.error('failed to parse triple extraction response') : $stderr.puts('crib: failed to parse triple extraction response')
   []
 end
 
@@ -350,7 +356,7 @@ end
 def cmd_write
   text = $stdin.read
   if text.nil? || text.strip.empty?
-    $stderr.puts 'crib: empty input'
+    defined?(Spill) ? Spill.error('empty input') : $stderr.puts('crib: empty input')
     exit 1
   end
   text = text.strip
@@ -366,7 +372,7 @@ def cmd_write
 
   entry_id = store_entry(type, text)
   if entry_id.nil?
-    $stderr.puts 'crib: failed to store entry'
+    defined?(Spill) ? Spill.error('failed to store entry') : $stderr.puts('crib: failed to store entry')
     exit 1
   end
 
@@ -385,7 +391,7 @@ def cmd_write
   embedding = generate_embedding(text)
   store_embedding(entry_id, embedding)
 
-  $stderr.puts "crib: stored entry ##{entry_id} (#{type}), #{triples.length} triples extracted"
+  defined?(Spill) ? Spill.info("stored entry ##{entry_id} (#{type}), #{triples.length} triples extracted") : $stderr.puts("crib: stored entry ##{entry_id} (#{type}), #{triples.length} triples extracted")
 end
 
 # ---------------------------------------------------------------------------
@@ -511,10 +517,10 @@ def rerank(prompt, combined_text)
   result = stdout.strip
   result.empty? ? combined_text : result
 rescue Errno::ENOENT
-  $stderr.puts 'crib: ollama not found, skipping rerank'
+  defined?(Spill) ? Spill.warn('ollama not found, skipping rerank') : $stderr.puts('crib: ollama not found, skipping rerank')
   combined_text
 rescue => e
-  $stderr.puts "crib: rerank failed: #{e.message}"
+  defined?(Spill) ? Spill.error("rerank failed: #{e.message}") : $stderr.puts("crib: rerank failed: #{e.message}")
   combined_text
 end
 
@@ -563,7 +569,7 @@ end
 
 def cmd_init
   init_db
-  $stderr.puts "crib: initialized #{DB_PATH}"
+  defined?(Spill) ? Spill.info("initialized #{DB_PATH}") : $stderr.puts("crib: initialized #{DB_PATH}")
 end
 
 def cmd_doctor
