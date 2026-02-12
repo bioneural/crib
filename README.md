@@ -75,7 +75,7 @@ The optional `type=` prefix on write categorizes entries:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CRIB_DB` | `memory/crib.db` | Path to the SQLite database |
+| `CRIB_DB` | `.state/crib/crib.db` | Path to the SQLite database |
 | `CRIB_SQLITE3` | auto-detected | Path to a sqlite3 binary with extension loading |
 | `CRIB_VEC_EXTENSION` | auto-detected | Path to the sqlite-vec `vec0` extension |
 

@@ -25,7 +25,7 @@
 #
 # Environment:
 #   CRIB_DB    Path to the SQLite database file.
-#              Default: memory/crib.db (relative to cwd)
+#              Default: .state/crib/crib.db (relative to cwd)
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
@@ -58,13 +58,14 @@
 require 'json'
 require 'open3'
 require 'net/http'
+require 'fileutils'
 require 'uri'
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, 'memory', 'crib.db') }
+DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, '.state', 'crib', 'crib.db') }
 EMBEDDING_MODEL = ENV.fetch('CRIB_EMBEDDING_MODEL', 'nomic-embed-text')
 EXTRACTION_MODEL = ENV.fetch('CRIB_EXTRACTION_MODEL', 'gemma3:1b')
 RERANK_MODEL = ENV.fetch('CRIB_RERANK_MODEL', 'gemma3:1b')
@@ -232,7 +233,7 @@ end
 
 def ensure_db_dir
   dir = File.dirname(DB_PATH)
-  Dir.mkdir(dir) unless Dir.exist?(dir)
+  FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
 end
 
 def init_db
