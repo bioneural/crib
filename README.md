@@ -211,7 +211,7 @@ Tests run against a temporary database that is created and destroyed on each run
 
 ## Prerequisites
 
-- Ruby 3.x (ships with macOS)
+- Ruby 3.x
 - SQLite 3.x with extension loading enabled (Homebrew's `sqlite` — the macOS system sqlite3 has extension loading disabled)
 - [sqlite-vec](https://github.com/asg017/sqlite-vec) (`pip3 install sqlite-vec`)
 - [Ollama](https://ollama.com) with the default models pulled (see below)
