@@ -24,8 +24,10 @@
 #   bin/crib doctor
 #
 # Environment:
-#   CRIB_DB    Path to the SQLite database file.
-#              Default: .state/crib/crib.db (relative to cwd)
+#   CRIB_DB       Path to the SQLite database file.
+#                 Default: .state/crib/crib.db (relative to cwd)
+#   CRIB_CHANNEL  Isolate a single retrieval channel: triples, fts, or vector.
+#                 When unset, all three channels run (default behavior).
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
@@ -544,9 +546,25 @@ def cmd_retrieve
   keywords = extract_keywords(prompt)
   exit 0 if keywords.empty?
 
-  triples = query_triples(keywords)
-  entries = query_fts(keywords)
-  vector_entries = query_vector(prompt)
+  channel = ENV['CRIB_CHANNEL']
+  case channel
+  when 'triples'
+    triples = query_triples(keywords)
+    entries = []
+    vector_entries = []
+  when 'fts'
+    triples = []
+    entries = query_fts(keywords)
+    vector_entries = []
+  when 'vector'
+    triples = []
+    entries = []
+    vector_entries = query_vector(prompt)
+  else
+    triples = query_triples(keywords)
+    entries = query_fts(keywords)
+    vector_entries = query_vector(prompt)
+  end
 
   all_entries = (entries + vector_entries).uniq { |e| e['id'] }
 
