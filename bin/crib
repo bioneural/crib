@@ -42,6 +42,13 @@
 #   CRIB_RRF_K    Reciprocal Rank Fusion smoothing constant. Higher values
 #                 reduce the influence of high-ranked results. Default: 60
 #                 (per Cormack et al. 2009).
+#   CRIB_RERANK_THRESHOLD
+#                 Minimum rerank score for results. Entries at or below this
+#                 score are filtered out. Default: 0.0 (filters entries the
+#                 reranker scored as completely irrelevant — exact zeros).
+#                 Noise queries produce exact-zero scores for all candidates,
+#                 enabling empty results. Set higher (e.g. 0.5) for strict
+#                 relevance filtering, or -1 to disable.
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
@@ -98,6 +105,7 @@ VECTOR_DISTANCE_THRESHOLD = ENV.fetch('CRIB_VECTOR_THRESHOLD', '0.5').to_f
 RRF_K = ENV.fetch('CRIB_RRF_K', '60').to_i
 RRF_LIMIT = 20
 RERANK_LIMIT = 10
+RERANK_THRESHOLD = ENV.fetch('CRIB_RERANK_THRESHOLD', '0.0').to_f
 FTS_CANDIDATES = 20
 VECTOR_CANDIDATES = 20
 
@@ -552,11 +560,13 @@ end
 def cross_encoder_rerank(prompt, entries)
   return entries if entries.empty?
 
-  scored = entries.map { |entry|
-    score = rerank_score(prompt, entry['content'])
-    entry.merge('rerank_score' => score)
+  threads = entries.map { |entry|
+    Thread.new { entry.merge('rerank_score' => rerank_score(prompt, entry['content'])) }
   }
-  scored.sort_by { |e| -e['rerank_score'] }.first(RERANK_LIMIT)
+  scored = threads.map(&:value)
+  scored.select { |e| e['rerank_score'] > RERANK_THRESHOLD }
+        .sort_by { |e| -e['rerank_score'] }
+        .first(RERANK_LIMIT)
 rescue => e
   defined?(Spill) ? Spill.error("rerank failed: #{e.message}") : $stderr.puts("crib: rerank failed: #{e.message}")
   entries.first(RERANK_LIMIT)

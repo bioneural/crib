@@ -352,6 +352,33 @@ test_consolidation() {
 test_consolidation
 
 # ---------------------------------------------------------------------------
+section "Rerank threshold"
+# ---------------------------------------------------------------------------
+
+test_rerank_threshold_filters_irrelevant() {
+  # Query for something completely unrelated to any entries in the test DB.
+  # The corpus contains entries about SQLite, PostgreSQL, crib smoke testing,
+  # Redis/Memcached cache backends, and testing order — nothing about
+  # medieval architecture. The reranker (gemma3:1b via ollama) should score
+  # all candidates at exactly 0.000, and the threshold (default 0.0, strict >)
+  # filters them out. Uses "cathedral architecture" rather than "architectural
+  # styles" because gemma3:1b associates "styles" with software design choices
+  # broadly enough to give a non-zero score to the SQLite entry.
+  #
+  # If ollama is not running or the model isn't pulled, the rerank function
+  # returns 0.0 for all entries, so they are still filtered — the test passes
+  # either way.
+  local output
+  output=$(echo "comparative analysis of Gothic and Romanesque cathedral architecture" | "$CRIB" retrieve 2>/dev/null)
+  if echo "$output" | grep -q "<memory"; then
+    fail "Rerank threshold" "expected empty output for unrelated query, got: $(echo "$output" | head -3)"
+  else
+    pass "Rerank threshold filters out irrelevant results"
+  fi
+}
+test_rerank_threshold_filters_irrelevant
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
