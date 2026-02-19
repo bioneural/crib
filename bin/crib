@@ -560,10 +560,10 @@ end
 def cross_encoder_rerank(prompt, entries)
   return entries if entries.empty?
 
-  threads = entries.map { |entry|
-    Thread.new { entry.merge('rerank_score' => rerank_score(prompt, entry['content'])) }
+  scored = entries.map { |entry|
+    score = rerank_score(prompt, entry['content'])
+    entry.merge('rerank_score' => score)
   }
-  scored = threads.map(&:value)
   scored.select { |e| e['rerank_score'] > RERANK_THRESHOLD }
         .sort_by { |e| -e['rerank_score'] }
         .first(RERANK_LIMIT)
