@@ -39,6 +39,9 @@
 #                 Maximum vector distance for results. Entries beyond this
 #                 distance are filtered out. Default: 0.5 (cosine).
 #                 If using L2 metric, a threshold of 1.0 is equivalent.
+#   CRIB_RRF_K    Reciprocal Rank Fusion smoothing constant. Higher values
+#                 reduce the influence of high-ranked results. Default: 60
+#                 (per Cormack et al. 2009).
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
@@ -92,6 +95,10 @@ OLLAMA_HOST = ENV.fetch('OLLAMA_HOST', 'http://localhost:11434')
 EMBEDDING_DIM = 768 # nomic-embed-text output dimension
 DISTANCE_METRIC = ENV.fetch('CRIB_DISTANCE_METRIC', 'cosine')
 VECTOR_DISTANCE_THRESHOLD = ENV.fetch('CRIB_VECTOR_THRESHOLD', '0.5').to_f
+RRF_K = ENV.fetch('CRIB_RRF_K', '60').to_i
+RRF_LIMIT = 10
+FTS_CANDIDATES = 20
+VECTOR_CANDIDATES = 20
 
 # sqlite3 binary: macOS system sqlite3 has extension loading disabled.
 # Homebrew's sqlite3 supports .load. Auto-detect or override via env var.
@@ -461,7 +468,7 @@ def query_fts(keywords)
     JOIN entries_fts f ON e.id = f.rowid
     WHERE entries_fts MATCH '#{escape_sql(fts_query)}'
     ORDER BY e.created_at DESC
-    LIMIT 10;
+    LIMIT #{FTS_CANDIDATES};
   SQL
 end
 
@@ -470,21 +477,47 @@ def query_vector(prompt)
   return [] if embedding.nil?
 
   json_vec = JSON.generate(embedding)
-  results = sql_query_json_vec(<<~SQL)
+  vec_results = sql_query_json_vec(<<~SQL)
     SELECT rowid, distance
     FROM entries_vec
     WHERE embedding MATCH '#{escape_sql(json_vec)}'
     ORDER BY distance
-    LIMIT 10;
+    LIMIT #{VECTOR_CANDIDATES};
   SQL
 
-  return [] if results.empty?
+  return [] if vec_results.empty?
 
-  results.reject! { |r| r['distance'] > VECTOR_DISTANCE_THRESHOLD }
-  return [] if results.empty?
+  vec_results.reject! { |r| r['distance'] > VECTOR_DISTANCE_THRESHOLD }
+  return [] if vec_results.empty?
 
-  ids = results.map { |r| r['rowid'] }.join(',')
-  sql_query_json("SELECT id, type, content, created_at FROM entries WHERE id IN (#{ids});")
+  dist_by_id = {}
+  vec_results.each { |r| dist_by_id[r['rowid']] = r['distance'] }
+
+  ids = vec_results.map { |r| r['rowid'] }.join(',')
+  entries = sql_query_json("SELECT id, type, content, created_at FROM entries WHERE id IN (#{ids});")
+
+  entries.each { |e| e['distance'] = dist_by_id[e['id']] }
+  entries.sort_by { |e| e['distance'] || Float::INFINITY }
+end
+
+def rrf_merge(fts_entries, vector_entries, k: RRF_K, limit: RRF_LIMIT)
+  scores = Hash.new(0.0)
+  entry_by_id = {}
+
+  fts_entries.each_with_index do |entry, rank|
+    id = entry['id']
+    scores[id] += 1.0 / (k + rank + 1)
+    entry_by_id[id] = entry
+  end
+
+  vector_entries.each_with_index do |entry, rank|
+    id = entry['id']
+    scores[id] += 1.0 / (k + rank + 1)
+    entry_by_id[id] ||= entry
+  end
+
+  sorted = scores.sort_by { |_id, score| -score }
+  sorted.first(limit).map { |id, _score| entry_by_id[id] }
 end
 
 def format_date(datetime_str)
@@ -507,8 +540,7 @@ end
 
 def format_entries(entries)
   return '' if entries.empty?
-  sorted = entries.sort_by { |e| e['created_at'] || '' }.reverse
-  lines = sorted.map do |e|
+  lines = entries.map do |e|
     date = format_date(e['created_at'])
     prefix = date ? "#{date} #{e['type']}" : e['type']
     "- [#{prefix}] #{e['content']}"
@@ -582,7 +614,15 @@ def cmd_retrieve
     vector_entries = query_vector(prompt)
   end
 
-  all_entries = (entries + vector_entries).uniq { |e| e['id'] }
+  all_entries = if entries.any? && vector_entries.any?
+                  rrf_merge(entries, vector_entries)
+                elsif entries.any?
+                  entries.first(RRF_LIMIT)
+                elsif vector_entries.any?
+                  vector_entries.first(RRF_LIMIT)
+                else
+                  []
+                end
 
   triples_text = format_triples(triples)
   entries_text = format_entries(all_entries)
