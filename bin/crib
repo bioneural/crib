@@ -32,9 +32,7 @@
 #                 Distance metric for vector search: cosine or L2.
 #                 Default: cosine (matches nomic-embed-text optimization).
 #                 Changing this on an existing database requires dropping and
-#                 recreating the entries_vec table (embeddings are re-inserted
-#                 automatically on next write, but existing entries need
-#                 re-embedding via: crib reindex).
+#                 recreating the entries_vec table and re-embedding all entries.
 #   CRIB_VECTOR_THRESHOLD
 #                 Maximum vector distance for results. Entries beyond this
 #                 distance are filtered out. Default: 0.5 (cosine).
@@ -72,7 +70,7 @@
 #     2. Extract keywords
 #     3. Query three channels: triples (SQL), full-text (FTS5), vectors (sqlite-vec)
 #     4. Merge and deduplicate
-#     5. Rerank with ollama if over token budget
+#     5. Rerank with ollama (cross-encoder logprob scoring)
 #     6. Wrap in <memory> tags and output to stdout
 #     7. Exit 0 always (fail-open)
 #

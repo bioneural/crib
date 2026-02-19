@@ -30,7 +30,7 @@ Crib extracts triples automatically on write using ollama. You write natural tex
 
 **Write path** — text arrives on stdin. Crib stores it as a full-text entry, generates a vector embedding via ollama, extracts fact triples, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
 
-**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. FTS and vector results are merged using Reciprocal Rank Fusion (RRF) — entries found by both channels score higher than single-channel results. A vector distance threshold filters noise before fusion. If the fused output exceeds the token budget, ollama reranks it. Results are wrapped in `<memory>` tags with a `context_time` timestamp. Each fact triple includes its `valid_from` date; each memory entry includes its `created_at` date. The consuming agent can reason about recency — whether a memory is older or newer than what's already in the conversation. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
+**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. FTS and vector results are merged using Reciprocal Rank Fusion (RRF) — entries found by both channels score higher than single-channel results. A vector distance threshold filters noise before fusion. The fused results are then reranked using a cross-encoder: ollama scores each query-document pair by extracting logprobs from a yes/no relevance judgment, and entries below a rerank threshold are discarded. The surviving results are wrapped in `<memory>` tags with a `context_time` timestamp. Each fact triple includes its `valid_from` date; each memory entry includes its `created_at` date. The consuming agent can reason about recency — whether a memory is older or newer than what's already in the conversation. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
 
 ---
 
@@ -82,6 +82,8 @@ The optional `type=` prefix on write categorizes entries:
 | `CRIB_DISTANCE_METRIC` | `cosine` | Distance metric for vector search: `cosine` or `L2` |
 | `CRIB_VECTOR_THRESHOLD` | `0.5` | Maximum vector distance — entries beyond this are filtered out |
 | `CRIB_RRF_K` | `60` | RRF smoothing constant (per Cormack et al. 2009) |
+| `CRIB_RERANK_THRESHOLD` | `0.0` | Minimum rerank score — entries at or below this are filtered out |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
 
 Model overrides are documented in [Prerequisites](#prerequisites).
 
@@ -205,8 +207,11 @@ Retrieve
 Consolidation
   ✓ Consolidation-on-write runs without error
 
+Rerank threshold
+  ✓ Rerank threshold filters out irrelevant results
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-21 passed
+22 passed
 ```
 
 Tests run against a temporary database that is created and destroyed on each run. No artifacts are left behind.
