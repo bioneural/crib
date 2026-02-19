@@ -96,7 +96,8 @@ EMBEDDING_DIM = 768 # nomic-embed-text output dimension
 DISTANCE_METRIC = ENV.fetch('CRIB_DISTANCE_METRIC', 'cosine')
 VECTOR_DISTANCE_THRESHOLD = ENV.fetch('CRIB_VECTOR_THRESHOLD', '0.5').to_f
 RRF_K = ENV.fetch('CRIB_RRF_K', '60').to_i
-RRF_LIMIT = 10
+RRF_LIMIT = 20
+RERANK_LIMIT = 10
 FTS_CANDIDATES = 20
 VECTOR_CANDIDATES = 20
 
@@ -548,30 +549,70 @@ def format_entries(entries)
   "## Memory entries\n\n#{lines.join("\n")}"
 end
 
-def rerank(prompt, combined_text)
-  return combined_text if combined_text.length <= CHAR_BUDGET
+def cross_encoder_rerank(prompt, entries)
+  return entries if entries.empty?
 
-  rerank_prompt = <<~PROMPT
-    Given this user prompt and a set of memory entries, select and return only
-    the most relevant entries that would help answer the prompt. Stay within
-    #{TOKEN_BUDGET} tokens. Return only the selected entries, no explanation.
-
-    Prompt: #{prompt}
-
-    Entries:
-    #{combined_text}
-  PROMPT
-
-  stdout, status = Open3.capture2('ollama', 'run', RERANK_MODEL, stdin_data: rerank_prompt)
-  return combined_text unless status.success?
-  result = stdout.strip
-  result.empty? ? combined_text : result
-rescue Errno::ENOENT
-  defined?(Spill) ? Spill.warn('ollama not found, skipping rerank') : $stderr.puts('crib: ollama not found, skipping rerank')
-  combined_text
+  scored = entries.map { |entry|
+    score = rerank_score(prompt, entry['content'])
+    entry.merge('rerank_score' => score)
+  }
+  scored.sort_by { |e| -e['rerank_score'] }.first(RERANK_LIMIT)
 rescue => e
   defined?(Spill) ? Spill.error("rerank failed: #{e.message}") : $stderr.puts("crib: rerank failed: #{e.message}")
-  combined_text
+  entries.first(RERANK_LIMIT)
+end
+
+def rerank_score(prompt, document)
+  uri = URI("#{OLLAMA_HOST}/api/chat")
+  req = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
+
+  rerank_prompt = "Judge whether the Document is relevant to the Query. " \
+    "Answer exactly \"yes\" or \"no\", nothing else.\n\n" \
+    "Query: #{prompt}\n\nDocument: #{document}"
+
+  req.body = JSON.generate({
+    model: RERANK_MODEL,
+    messages: [{ role: 'user', content: rerank_prompt }],
+    stream: false,
+    logprobs: true,
+    top_logprobs: 10,
+    options: { temperature: 0.0, num_predict: 1 }
+  })
+
+  response = Net::HTTP.start(uri.hostname, uri.port) do |http|
+    http.read_timeout = 30
+    http.request(req)
+  end
+
+  return 0.0 unless response.is_a?(Net::HTTPSuccess)
+
+  data = JSON.parse(response.body)
+  top = data.dig('logprobs', 0, 'top_logprobs')
+  return 0.0 unless top
+
+  yes_lp = nil
+  no_lp = nil
+  top.each do |t|
+    token = t['token'].strip.downcase
+    yes_lp = t['logprob'] if token == 'yes' && yes_lp.nil?
+    no_lp = t['logprob'] if token == 'no' && no_lp.nil?
+  end
+
+  if yes_lp && no_lp
+    yes_p = Math.exp(yes_lp)
+    no_p = Math.exp(no_lp)
+    yes_p / (yes_p + no_p)
+  elsif yes_lp
+    1.0
+  else
+    0.0
+  end
+rescue Errno::ECONNREFUSED
+  defined?(Spill) ? Spill.warn('ollama not running (connection refused), skipping rerank') : $stderr.puts('crib: ollama not running, skipping rerank')
+  0.0
+rescue => e
+  defined?(Spill) ? Spill.error("rerank_score failed: #{e.message}") : $stderr.puts("crib: rerank_score failed: #{e.message}")
+  0.0
 end
 
 def truncate(text, max_chars)
@@ -624,13 +665,14 @@ def cmd_retrieve
                   []
                 end
 
+  all_entries = cross_encoder_rerank(prompt, all_entries) if all_entries.any?
+
   triples_text = format_triples(triples)
   entries_text = format_entries(all_entries)
 
   combined = [triples_text, entries_text].reject(&:empty?).join("\n\n")
   exit 0 if combined.empty?
 
-  combined = rerank(prompt, combined) if combined.length > CHAR_BUDGET
   combined = truncate(combined, CHAR_BUDGET)
 
   context_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
