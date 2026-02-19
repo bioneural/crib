@@ -30,7 +30,7 @@ Crib extracts triples automatically on write using ollama. You write natural tex
 
 **Write path** — text arrives on stdin. Crib stores it as a full-text entry, generates a vector embedding via ollama, extracts fact triples, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
 
-**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. Results are merged, deduplicated, sorted newest-first, reranked with ollama if over budget, and wrapped in `<memory>` tags with a `context_time` timestamp. Each fact triple includes its `valid_from` date; each memory entry includes its `created_at` date. The consuming agent can reason about recency — whether a memory is older or newer than what's already in the conversation. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
+**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. FTS and vector results are merged using Reciprocal Rank Fusion (RRF) — entries found by both channels score higher than single-channel results. A vector distance threshold filters noise before fusion. If the fused output exceeds the token budget, ollama reranks it. Results are wrapped in `<memory>` tags with a `context_time` timestamp. Each fact triple includes its `valid_from` date; each memory entry includes its `created_at` date. The consuming agent can reason about recency — whether a memory is older or newer than what's already in the conversation. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
 
 ---
 
@@ -78,6 +78,10 @@ The optional `type=` prefix on write categorizes entries:
 | `CRIB_DB` | `.state/crib/crib.db` | Path to the SQLite database |
 | `CRIB_SQLITE3` | auto-detected | Path to a sqlite3 binary with extension loading |
 | `CRIB_VEC_EXTENSION` | auto-detected | Path to the sqlite-vec `vec0` extension |
+| `CRIB_CHANNEL` | all channels | Isolate a single retrieval channel: `triples`, `fts`, or `vector` |
+| `CRIB_DISTANCE_METRIC` | `cosine` | Distance metric for vector search: `cosine` or `L2` |
+| `CRIB_VECTOR_THRESHOLD` | `0.5` | Maximum vector distance — entries beyond this are filtered out |
+| `CRIB_RRF_K` | `60` | RRF smoothing constant (per Cormack et al. 2009) |
 
 Model overrides are documented in [Prerequisites](#prerequisites).
 
