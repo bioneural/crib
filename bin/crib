@@ -15,6 +15,7 @@
 #   crib retrieve  Query memory and return relevant context
 #   crib init      Initialize the database (run automatically on first write)
 #   crib doctor    Check all prerequisites and report status (JSON on stdout)
+#   crib maintain  Run contradiction detection, correction linking, and staleness (JSON on stdout)
 #
 # Usage:
 #   echo "Chose SQLite for storage" | bin/crib write
@@ -22,6 +23,7 @@
 #   echo "what database did we choose?" | bin/crib retrieve
 #   bin/crib init
 #   bin/crib doctor
+#   bin/crib maintain
 #
 # Environment:
 #   CRIB_DB       Path to the SQLite database file.
@@ -52,8 +54,10 @@
 #   write     — status on stderr, nothing on stdout
 #   retrieve  — <memory context_time="...">...</memory> on stdout (empty = nothing relevant)
 #   init      — status on stderr
+#   maintain  — JSON on stdout: {"contradictions_found":N,"corrections_linked":N,"stale_count":N,"supersessions_applied":N}
 #
-# Dependencies: ruby (stdlib only), sqlite3 (CLI), sqlite-vec (extension), ollama
+# Dependencies: Ruby stdlib plus the sqlite3 gem. No other gems.
+#               External: sqlite-vec (extension), ollama
 #
 # Behavior:
 #   write:
@@ -72,7 +76,15 @@
 #     4. Merge and deduplicate
 #     5. Rerank with ollama (cross-encoder logprob scoring)
 #     6. Wrap in <memory> tags and output to stdout
-#     7. Exit 0 always (fail-open)
+#     7. Update last_retrieved_at on returned entries
+#     8. Exit 0 always (fail-open)
+#
+#   maintain:
+#     1. Detect contradictions among recent entries via FTS5 similarity + classify
+#     2. Link corrections to their originals via vector search
+#     3. Report stale entries (not retrieved in 30+ days)
+#     4. Output JSON summary to stdout
+#     5. Exit 0 always (fail-open)
 #
 # Schema: see the SCHEMA constant below or the README.
 
@@ -81,12 +93,15 @@ require 'open3'
 require 'net/http'
 require 'fileutils'
 require 'uri'
+require 'sqlite3'
 
 SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
 if File.directory?(SPILL_HOME)
   require File.join(SPILL_HOME, 'lib', 'spill')
   Spill.configure(tool: 'crib')
 end
+
+SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', __dir__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -107,13 +122,6 @@ RERANK_THRESHOLD = ENV.fetch('CRIB_RERANK_THRESHOLD', '0.0').to_f
 FTS_CANDIDATES = 20
 VECTOR_CANDIDATES = 20
 
-# sqlite3 binary: macOS system sqlite3 has extension loading disabled.
-# Homebrew's sqlite3 supports .load. Auto-detect or override via env var.
-SQLITE3 = ENV.fetch('CRIB_SQLITE3') {
-  brew_path = '/opt/homebrew/opt/sqlite/bin/sqlite3'
-  File.executable?(brew_path) ? brew_path : 'sqlite3'
-}
-
 # sqlite-vec extension: auto-detect via Python package or override via env var.
 VEC_EXTENSION = ENV.fetch('CRIB_VEC_EXTENSION') {
   detected, status = Open3.capture2('python3', '-c', 'import sqlite_vec; print(sqlite_vec.loadable_path())')
@@ -121,6 +129,8 @@ VEC_EXTENSION = ENV.fetch('CRIB_VEC_EXTENSION') {
 }
 TOKEN_BUDGET = 2000
 CHAR_BUDGET = TOKEN_BUDGET * 4
+
+STALENESS_DAYS = 30
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -190,75 +200,73 @@ VEC_SCHEMA = <<~SQL
 SQL
 
 # ---------------------------------------------------------------------------
+# Database connection
+# ---------------------------------------------------------------------------
+
+def open_db
+  db = SQLite3::Database.new(DB_PATH)
+  db.busy_timeout = 5000
+  db.results_as_hash = true
+  db
+end
+
+def open_db_vec
+  db = open_db
+  db.enable_load_extension(true)
+  db.load_extension(VEC_EXTENSION)
+  db.enable_load_extension(false)
+  db
+rescue SQLite3::Exception => e
+  spill_log(:error, "sqlite-vec load error: #{e.message}")
+  nil
+end
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def escape_sql(str)
-  str.gsub("'", "''")
+def spill_log(level, msg, **ctx)
+  if defined?(Spill)
+    Spill.send(level, msg, **ctx)
+  else
+    $stderr.puts("crib: #{msg}")
+  end
 end
 
-def sql_exec(query)
-  stdout, stderr, status = Open3.capture3(SQLITE3, DB_PATH, stdin_data: query)
-  unless status.success?
-    defined?(Spill) ? Spill.error("sqlite3 error: #{stderr.strip}") : $stderr.puts("crib: sqlite3 error: #{stderr.strip}")
-    return nil
-  end
-  stdout.strip
+def sql_exec(db, query, params = [])
+  db.execute(query, params)
+rescue SQLite3::Exception => e
+  spill_log(:error, "sqlite3 error: #{e.message}")
+  nil
 end
 
-def sql_query_json(query)
-  stdout, stderr, status = Open3.capture3(SQLITE3, '-json', DB_PATH, stdin_data: query)
-  unless status.success?
-    defined?(Spill) ? Spill.error("sqlite3 error: #{stderr.strip}") : $stderr.puts("crib: sqlite3 error: #{stderr.strip}")
-    return []
-  end
-  return [] if stdout.strip.empty?
-  JSON.parse(stdout)
-rescue JSON::ParserError => e
-  defined?(Spill) ? Spill.error("JSON parse error: #{e.message}") : $stderr.puts("crib: JSON parse error: #{e.message}")
+def sql_query(db, query, params = [])
+  db.execute(query, params)
+rescue SQLite3::Exception => e
+  spill_log(:error, "sqlite3 error: #{e.message}")
   []
 end
 
-def sql_exec_vec(query)
-  stdout, stderr, status = Open3.capture3(
-    SQLITE3, '-cmd', ".load #{VEC_EXTENSION}", DB_PATH,
-    stdin_data: query
-  )
-  unless status.success?
-    defined?(Spill) ? Spill.error("sqlite3+vec error: #{stderr.strip}") : $stderr.puts("crib: sqlite3+vec error: #{stderr.strip}")
-    return nil
-  end
-  stdout.strip
-end
-
-def sql_query_json_vec(query)
-  stdout, stderr, status = Open3.capture3(
-    SQLITE3, '-json', '-cmd', ".load #{VEC_EXTENSION}", DB_PATH,
-    stdin_data: query
-  )
-  unless status.success?
-    defined?(Spill) ? Spill.error("sqlite3+vec error: #{stderr.strip}") : $stderr.puts("crib: sqlite3+vec error: #{stderr.strip}")
-    return []
-  end
-  return [] if stdout.strip.empty?
-  JSON.parse(stdout)
-rescue JSON::ParserError => e
-  defined?(Spill) ? Spill.error("JSON parse error: #{e.message}") : $stderr.puts("crib: JSON parse error: #{e.message}")
-  []
+def sql_insert_returning_id(db, query, params = [])
+  db.execute(query, params)
+  db.last_insert_row_id
+rescue SQLite3::Exception => e
+  spill_log(:error, "sqlite3 error: #{e.message}")
+  nil
 end
 
 def call_ollama(prompt, model)
   stdout, stderr, status = Open3.capture3('ollama', 'run', model, stdin_data: prompt)
   unless status.success?
-    defined?(Spill) ? Spill.error("ollama error (#{model}): #{stderr.strip}") : $stderr.puts("crib: ollama error (#{model}): #{stderr.strip}")
+    spill_log(:error, "ollama error (#{model}): #{stderr.strip}")
     return nil
   end
   stdout.strip
 rescue Errno::ENOENT
-  defined?(Spill) ? Spill.warn('ollama not found') : $stderr.puts('crib: ollama not found')
+  spill_log(:warn, 'ollama not found')
   nil
 rescue => e
-  defined?(Spill) ? Spill.error("ollama failed: #{e.message}") : $stderr.puts("crib: ollama failed: #{e.message}")
+  spill_log(:error, "ollama failed: #{e.message}")
   nil
 end
 
@@ -271,10 +279,36 @@ def ensure_db_dir
   FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
 end
 
+def has_column?(db, table, column)
+  cols = db.table_info(table)
+  cols.any? { |c| c['name'] == column }
+rescue SQLite3::Exception
+  false
+end
+
+def run_migrations(db)
+  unless has_column?(db, 'entries', 'last_retrieved_at')
+    db.execute("ALTER TABLE entries ADD COLUMN last_retrieved_at TEXT;")
+  end
+  unless has_column?(db, 'entries', 'superseded_by')
+    db.execute("ALTER TABLE entries ADD COLUMN superseded_by INTEGER;")
+  end
+rescue SQLite3::Exception => e
+  spill_log(:error, "migration error: #{e.message}")
+end
+
 def init_db
   ensure_db_dir
-  sql_exec(SCHEMA)
-  sql_exec_vec(VEC_SCHEMA)
+  db = open_db
+  db.execute_batch(SCHEMA)
+  run_migrations(db)
+  db.close
+
+  vec_db = open_db_vec
+  if vec_db
+    vec_db.execute_batch(VEC_SCHEMA)
+    vec_db.close
+  end
 end
 
 def ollama_embed(text)
@@ -288,17 +322,17 @@ def ollama_embed(text)
   end
 
   unless response.is_a?(Net::HTTPSuccess)
-    defined?(Spill) ? Spill.error("ollama embed error: HTTP #{response.code}") : $stderr.puts("crib: ollama embed error: HTTP #{response.code}")
+    spill_log(:error, "ollama embed error: HTTP #{response.code}")
     return nil
   end
 
   data = JSON.parse(response.body)
   data['embeddings']&.first
 rescue Errno::ECONNREFUSED
-  defined?(Spill) ? Spill.warn('ollama not running (connection refused)') : $stderr.puts('crib: ollama not running (connection refused)')
+  spill_log(:warn, 'ollama not running (connection refused)')
   nil
 rescue => e
-  defined?(Spill) ? Spill.error("ollama embed failed: #{e.message}") : $stderr.puts("crib: ollama embed failed: #{e.message}")
+  spill_log(:error, "ollama embed failed: #{e.message}")
   nil
 end
 
@@ -306,12 +340,10 @@ end
 # Write
 # ---------------------------------------------------------------------------
 
-def store_entry(type, content)
-  result = sql_exec(<<~SQL)
-    INSERT INTO entries(type, content) VALUES ('#{escape_sql(type)}', '#{escape_sql(content)}');
-    SELECT last_insert_rowid();
-  SQL
-  result&.to_i
+def store_entry(db, type, content)
+  sql_insert_returning_id(db,
+    "INSERT INTO entries(type, content) VALUES (?, ?);",
+    [type, content])
 end
 
 def extract_triples(text)
@@ -334,58 +366,55 @@ def extract_triples(text)
 
   JSON.parse(json_str)
 rescue JSON::ParserError
-  defined?(Spill) ? Spill.error('failed to parse triple extraction response') : $stderr.puts('crib: failed to parse triple extraction response')
+  spill_log(:error, 'failed to parse triple extraction response')
   []
 end
 
-def find_or_create_entity(name, type)
-  existing = sql_query_json("SELECT id FROM entities WHERE name = '#{escape_sql(name)}' LIMIT 1;")
+def find_or_create_entity(db, name, type)
+  existing = sql_query(db, "SELECT id FROM entities WHERE name = ? LIMIT 1;", [name])
   return existing.first['id'] unless existing.empty?
 
-  result = sql_exec(<<~SQL)
-    INSERT INTO entities(name, type) VALUES ('#{escape_sql(name)}', '#{escape_sql(type)}');
-    SELECT last_insert_rowid();
-  SQL
-  result&.to_i
+  sql_insert_returning_id(db,
+    "INSERT INTO entities(name, type) VALUES (?, ?);",
+    [name, type])
 end
 
-def store_triple(subject_name, subject_type, predicate, object_name, object_type, raw_text)
-  subject_id = find_or_create_entity(subject_name, subject_type)
-  object_id = find_or_create_entity(object_name, object_type)
+def store_triple(db, subject_name, subject_type, predicate, object_name, object_type, raw_text)
+  subject_id = find_or_create_entity(db, subject_name, subject_type)
+  object_id = find_or_create_entity(db, object_name, object_type)
   return if subject_id.nil? || object_id.nil?
 
   # Consolidation: supersede existing relations with same subject+predicate
-  sql_exec(<<~SQL)
-    UPDATE relations SET valid_until = datetime('now')
-    WHERE subject_id = #{subject_id}
-      AND predicate = '#{escape_sql(predicate)}'
-      AND valid_until IS NULL;
-  SQL
+  sql_exec(db,
+    "UPDATE relations SET valid_until = datetime('now') WHERE subject_id = ? AND predicate = ? AND valid_until IS NULL;",
+    [subject_id, predicate])
 
-  relation_id = sql_exec(<<~SQL)&.to_i
-    INSERT INTO relations(subject_id, predicate, object_id)
-    VALUES (#{subject_id}, '#{escape_sql(predicate)}', #{object_id});
-    SELECT last_insert_rowid();
-  SQL
+  relation_id = sql_insert_returning_id(db,
+    "INSERT INTO relations(subject_id, predicate, object_id) VALUES (?, ?, ?);",
+    [subject_id, predicate, object_id])
   return if relation_id.nil?
 
-  sql_exec("INSERT INTO sources(relation_id, raw_text) VALUES (#{relation_id}, '#{escape_sql(raw_text)}');")
+  sql_exec(db,
+    "INSERT INTO sources(relation_id, raw_text) VALUES (?, ?);",
+    [relation_id, raw_text])
 end
 
 def generate_embedding(text)
   ollama_embed(text)
 end
 
-def store_embedding(entry_id, embedding)
-  return if embedding.nil? || entry_id.nil?
+def store_embedding(vec_db, entry_id, embedding)
+  return if embedding.nil? || entry_id.nil? || vec_db.nil?
   json_vec = JSON.generate(embedding)
-  sql_exec_vec("INSERT INTO entries_vec(rowid, embedding) VALUES (#{entry_id}, '#{escape_sql(json_vec)}');")
+  sql_exec(vec_db,
+    "INSERT INTO entries_vec(rowid, embedding) VALUES (?, ?);",
+    [entry_id, json_vec])
 end
 
 def cmd_write
   text = $stdin.read
   if text.nil? || text.strip.empty?
-    defined?(Spill) ? Spill.error('empty input') : $stderr.puts('crib: empty input')
+    spill_log(:error, 'empty input')
     exit 1
   end
   text = text.strip
@@ -399,15 +428,18 @@ def cmd_write
 
   init_db
 
-  entry_id = store_entry(type, text)
+  db = open_db
+  entry_id = store_entry(db, type, text)
   if entry_id.nil?
-    defined?(Spill) ? Spill.error('failed to store entry') : $stderr.puts('crib: failed to store entry')
+    spill_log(:error, 'failed to store entry')
+    db.close
     exit 1
   end
 
   triples = extract_triples(text)
   triples.each do |triple|
     store_triple(
+      db,
       triple['subject'] || 'unknown',
       triple['subject_type'] || 'concept',
       triple['predicate'] || 'related_to',
@@ -416,11 +448,14 @@ def cmd_write
       text
     )
   end
+  db.close
 
   embedding = generate_embedding(text)
-  store_embedding(entry_id, embedding)
+  vec_db = open_db_vec
+  store_embedding(vec_db, entry_id, embedding)
+  vec_db&.close
 
-  defined?(Spill) ? Spill.info("stored entry ##{entry_id} (#{type}), #{triples.length} triples extracted") : $stderr.puts("crib: stored entry ##{entry_id} (#{type}), #{triples.length} triples extracted")
+  spill_log(:info, "stored entry ##{entry_id} (#{type}), #{triples.length} triples extracted")
 end
 
 # ---------------------------------------------------------------------------
@@ -441,12 +476,12 @@ def extract_keywords(prompt)
   words.reject { |w| w.length < 3 || STOP_WORDS.include?(w) }.uniq
 end
 
-def query_triples(keywords)
+def query_triples(db, keywords)
   return [] if keywords.empty?
 
-  like_clauses = keywords.map { |k| "name LIKE '%#{escape_sql(k)}%'" }.join(' OR ')
+  like_clauses = keywords.map { "name LIKE '%' || ? || '%'" }.join(' OR ')
 
-  sql_query_json(<<~SQL)
+  sql_query(db, <<~SQL, keywords + keywords)
     SELECT
       s.name AS subject,
       r.predicate,
@@ -464,44 +499,50 @@ def query_triples(keywords)
   SQL
 end
 
-def query_fts(keywords)
+def query_fts(db, keywords)
   return [] if keywords.empty?
 
   fts_query = keywords.join(' OR ')
 
-  sql_query_json(<<~SQL)
+  sql_query(db, <<~SQL, [fts_query])
     SELECT e.id, e.type, e.content, e.created_at
     FROM entries e
     JOIN entries_fts f ON e.id = f.rowid
-    WHERE entries_fts MATCH '#{escape_sql(fts_query)}'
+    WHERE entries_fts MATCH ?
+      AND e.superseded_by IS NULL
     ORDER BY e.created_at DESC
     LIMIT #{FTS_CANDIDATES};
   SQL
 end
 
-def query_vector(prompt)
+def query_vector(vec_db, prompt)
+  return [] if vec_db.nil?
+
   embedding = ollama_embed(prompt)
   return [] if embedding.nil?
 
   json_vec = JSON.generate(embedding)
-  vec_results = sql_query_json_vec(<<~SQL)
+  vec_results = sql_query(vec_db, <<~SQL, [json_vec])
     SELECT rowid, distance
     FROM entries_vec
-    WHERE embedding MATCH '#{escape_sql(json_vec)}'
+    WHERE embedding MATCH ?
     ORDER BY distance
     LIMIT #{VECTOR_CANDIDATES};
   SQL
 
   return [] if vec_results.empty?
 
-  vec_results.reject! { |r| r['distance'] > VECTOR_DISTANCE_THRESHOLD }
+  vec_results = vec_results.reject { |r| r['distance'] > VECTOR_DISTANCE_THRESHOLD }
   return [] if vec_results.empty?
 
   dist_by_id = {}
   vec_results.each { |r| dist_by_id[r['rowid']] = r['distance'] }
 
-  ids = vec_results.map { |r| r['rowid'] }.join(',')
-  entries = sql_query_json("SELECT id, type, content, created_at FROM entries WHERE id IN (#{ids});")
+  ids = vec_results.map { |r| r['rowid'] }
+  placeholders = ids.map { '?' }.join(',')
+  entries = sql_query(vec_db,
+    "SELECT id, type, content, created_at FROM entries WHERE id IN (#{placeholders}) AND superseded_by IS NULL;",
+    ids)
 
   entries.each { |e| e['distance'] = dist_by_id[e['id']] }
   entries.sort_by { |e| e['distance'] || Float::INFINITY }
@@ -566,7 +607,7 @@ def cross_encoder_rerank(prompt, entries)
         .sort_by { |e| -e['rerank_score'] }
         .first(RERANK_LIMIT)
 rescue => e
-  defined?(Spill) ? Spill.error("rerank failed: #{e.message}") : $stderr.puts("crib: rerank failed: #{e.message}")
+  spill_log(:error, "rerank failed: #{e.message}")
   entries.first(RERANK_LIMIT)
 end
 
@@ -616,16 +657,24 @@ def rerank_score(prompt, document)
     0.0
   end
 rescue Errno::ECONNREFUSED
-  defined?(Spill) ? Spill.warn('ollama not running (connection refused), skipping rerank') : $stderr.puts('crib: ollama not running, skipping rerank')
+  spill_log(:warn, 'ollama not running (connection refused), skipping rerank')
   0.0
 rescue => e
-  defined?(Spill) ? Spill.error("rerank_score failed: #{e.message}") : $stderr.puts("crib: rerank_score failed: #{e.message}")
+  spill_log(:error, "rerank_score failed: #{e.message}")
   0.0
 end
 
 def truncate(text, max_chars)
   return text if text.length <= max_chars
   text[0, max_chars] + "\n\n[truncated — #{TOKEN_BUDGET} token budget exceeded]"
+end
+
+def update_last_retrieved(db, entry_ids)
+  return if entry_ids.empty?
+  placeholders = entry_ids.map { '?' }.join(',')
+  sql_exec(db,
+    "UPDATE entries SET last_retrieved_at = datetime('now') WHERE id IN (#{placeholders});",
+    entry_ids)
 end
 
 def cmd_retrieve
@@ -643,24 +692,31 @@ def cmd_retrieve
   keywords = extract_keywords(prompt)
   exit 0 if keywords.empty?
 
+  db = open_db
+  run_migrations(db)
+  vec_db = open_db_vec
+  if vec_db
+    run_migrations(vec_db)
+  end
+
   channel = ENV['CRIB_CHANNEL']
   case channel
   when 'triples'
-    triples = query_triples(keywords)
+    triples = query_triples(db, keywords)
     entries = []
     vector_entries = []
   when 'fts'
     triples = []
-    entries = query_fts(keywords)
+    entries = query_fts(db, keywords)
     vector_entries = []
   when 'vector'
     triples = []
     entries = []
-    vector_entries = query_vector(prompt)
+    vector_entries = query_vector(vec_db, prompt)
   else
-    triples = query_triples(keywords)
-    entries = query_fts(keywords)
-    vector_entries = query_vector(prompt)
+    triples = query_triples(db, keywords)
+    entries = query_fts(db, keywords)
+    vector_entries = query_vector(vec_db, prompt)
   end
 
   all_entries = if entries.any? && vector_entries.any?
@@ -675,6 +731,13 @@ def cmd_retrieve
 
   all_entries = cross_encoder_rerank(prompt, all_entries) if all_entries.any?
 
+  # Track access times on returned entries
+  retrieved_ids = all_entries.map { |e| e['id'] }.compact
+  update_last_retrieved(db, retrieved_ids)
+
+  db.close
+  vec_db&.close
+
   triples_text = format_triples(triples)
   entries_text = format_entries(all_entries)
 
@@ -688,12 +751,166 @@ def cmd_retrieve
 end
 
 # ---------------------------------------------------------------------------
+# Maintain
+# ---------------------------------------------------------------------------
+
+def classify_contradiction(content_a, content_b)
+  classify_bin = File.join(SCREEN_HOME, 'bin', 'classify')
+  return nil unless File.executable?(classify_bin)
+
+  input = JSON.generate({
+    'condition' => 'These two statements contradict each other (they make incompatible claims about the same topic).',
+    'content' => "Statement A: #{content_a}\n\nStatement B: #{content_b}"
+  })
+
+  stdout, status = Open3.capture2(classify_bin, stdin_data: input)
+  return nil unless status.success?
+  stdout.strip.downcase
+rescue Errno::ENOENT
+  spill_log(:warn, 'classify not found, skipping contradiction detection')
+  nil
+rescue => e
+  spill_log(:error, "classify failed: #{e.message}")
+  nil
+end
+
+def cmd_maintain
+  unless db_exists?
+    puts JSON.generate({ contradictions_found: 0, corrections_linked: 0, stale_count: 0, supersessions_applied: 0 })
+    exit 0
+  end
+
+  db = open_db
+  run_migrations(db)
+
+  contradictions_found = 0
+  corrections_linked = 0
+  supersessions_applied = 0
+  stale_count = 0
+
+  # --- Contradiction detection ---
+  # Compare recent entries pairwise via FTS5 similarity. For each pair
+  # with matching terms, call classify to confirm a contradiction.
+  begin
+    recent = sql_query(db,
+      "SELECT id, content FROM entries WHERE superseded_by IS NULL ORDER BY created_at DESC LIMIT 50;")
+
+    recent.each_with_index do |entry_a, i|
+      keywords_a = extract_keywords(entry_a['content'])
+      next if keywords_a.empty?
+
+      fts_query = keywords_a.first(5).join(' OR ')
+      similar = sql_query(db, <<~SQL, [fts_query, entry_a['id']])
+        SELECT e.id, e.content, e.created_at
+        FROM entries e
+        JOIN entries_fts f ON e.id = f.rowid
+        WHERE entries_fts MATCH ?
+          AND e.id != ?
+          AND e.superseded_by IS NULL
+        ORDER BY e.created_at DESC
+        LIMIT 5;
+      SQL
+
+      similar.each do |entry_b|
+        answer = classify_contradiction(entry_a['content'], entry_b['content'])
+        next unless answer == 'yes'
+
+        contradictions_found += 1
+
+        # Supersede the older entry
+        older, newer = [entry_a, entry_b].sort_by { |e| e['created_at'] || '' }
+        sql_exec(db,
+          "UPDATE entries SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL;",
+          [newer['id'], older['id']])
+        supersessions_applied += 1
+      end
+    end
+  rescue => e
+    spill_log(:error, "contradiction detection failed: #{e.message}")
+  end
+
+  # --- Correction linking ---
+  # Find type=correction entries without a supersession link, then find
+  # the original entry being corrected via vector search.
+  begin
+    corrections = sql_query(db,
+      "SELECT id, content FROM entries WHERE type = 'correction' AND superseded_by IS NULL;")
+
+    vec_db = open_db_vec
+
+    corrections.each do |correction|
+      embedding = ollama_embed(correction['content'])
+      next if embedding.nil? || vec_db.nil?
+
+      json_vec = JSON.generate(embedding)
+      candidates = sql_query(vec_db, <<~SQL, [json_vec, correction['id']])
+        SELECT rowid, distance
+        FROM entries_vec
+        WHERE embedding MATCH ?
+        ORDER BY distance
+        LIMIT 5;
+      SQL
+
+      candidates = candidates.reject { |c| c['rowid'] == correction['id'] }
+      next if candidates.empty?
+
+      # Find the closest non-correction entry that is not already superseded
+      candidate_ids = candidates.map { |c| c['rowid'] }
+      placeholders = candidate_ids.map { '?' }.join(',')
+      originals = sql_query(db,
+        "SELECT id FROM entries WHERE id IN (#{placeholders}) AND type != 'correction' AND superseded_by IS NULL;",
+        candidate_ids)
+
+      next if originals.empty?
+
+      # Supersede the closest original
+      original_id = originals.first['id']
+      sql_exec(db,
+        "UPDATE entries SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL;",
+        [correction['id'], original_id])
+      corrections_linked += 1
+      supersessions_applied += 1
+    end
+
+    vec_db&.close
+  rescue => e
+    spill_log(:error, "correction linking failed: #{e.message}")
+  end
+
+  # --- Staleness tracking ---
+  begin
+    stale = sql_query(db, <<~SQL, [STALENESS_DAYS])
+      SELECT COUNT(*) AS cnt FROM entries
+      WHERE superseded_by IS NULL
+        AND last_retrieved_at IS NOT NULL
+        AND last_retrieved_at < datetime('now', '-' || ? || ' days');
+    SQL
+    stale_count = stale.first['cnt'] if stale.any?
+  rescue => e
+    spill_log(:error, "staleness check failed: #{e.message}")
+  end
+
+  db.close
+
+  result = {
+    contradictions_found: contradictions_found,
+    corrections_linked: corrections_linked,
+    stale_count: stale_count,
+    supersessions_applied: supersessions_applied
+  }
+
+  spill_log(:info, "maintain complete", **result)
+  puts JSON.generate(result)
+  exit 0
+end
+
+# ---------------------------------------------------------------------------
 # Init / Schema
 # ---------------------------------------------------------------------------
 
 def cmd_init
   init_db
-  defined?(Spill) ? Spill.info("initialized #{DB_PATH}") : $stderr.puts("crib: initialized #{DB_PATH}")
+  spill_log(:info, "initialized #{DB_PATH}")
 end
 
 def cmd_doctor
@@ -702,24 +919,32 @@ def cmd_doctor
   # Ruby
   report['ruby'] = { 'version' => RUBY_VERSION, 'ok' => true }
 
-  # sqlite3 binary
-  sqlite_out, sqlite_status = Open3.capture2(SQLITE3, '--version')
-  report['sqlite3'] = {
-    'path' => SQLITE3,
-    'version' => sqlite_status.success? ? sqlite_out.strip.split.first : nil,
-    'ok' => sqlite_status.success?
+  # sqlite3 gem
+  report['sqlite3_gem'] = {
+    'version' => SQLite3::VERSION,
+    'ok' => true
   }
 
   # sqlite-vec extension
-  vec_out, vec_status = Open3.capture2(
-    SQLITE3, '-cmd', ".load #{VEC_EXTENSION}", ':memory:',
-    stdin_data: 'SELECT vec_version();'
-  )
-  report['sqlite_vec'] = {
-    'path' => VEC_EXTENSION,
-    'version' => vec_status.success? ? vec_out.strip : nil,
-    'ok' => vec_status.success?
-  }
+  begin
+    vec_db = SQLite3::Database.new(':memory:')
+    vec_db.enable_load_extension(true)
+    vec_db.load_extension(VEC_EXTENSION)
+    vec_version = vec_db.execute('SELECT vec_version();').first.first
+    vec_db.close
+    report['sqlite_vec'] = {
+      'path' => VEC_EXTENSION,
+      'version' => vec_version,
+      'ok' => true
+    }
+  rescue => e
+    report['sqlite_vec'] = {
+      'path' => VEC_EXTENSION,
+      'version' => nil,
+      'ok' => false,
+      'error' => e.message
+    }
+  end
 
   # ollama
   ollama_out, ollama_status = Open3.capture2('ollama', '--version')
@@ -775,9 +1000,10 @@ def usage
       retrieve  Query memory for relevant context (stdin)
       init      Initialize the database
       doctor    Check prerequisites and report status (JSON)
+      maintain  Run contradiction detection, correction linking, and staleness (JSON)
 
     Environment:
-      CRIB_DB   Path to SQLite database (default: memory/crib.db)
+      CRIB_DB   Path to SQLite database (default: .state/crib/crib.db)
   USAGE
   exit 1
 end
@@ -788,5 +1014,6 @@ when 'write'    then cmd_write
 when 'retrieve' then cmd_retrieve
 when 'init'     then cmd_init
 when 'doctor'   then cmd_doctor
+when 'maintain' then cmd_maintain
 else usage
 end
