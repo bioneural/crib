@@ -6,7 +6,7 @@
 
 Agents forget between sessions. Decisions made yesterday are relitigated today. Context that shaped a choice evaporates before the next prompt arrives. Crib is the storage layer that solves this — one SQLite database with three query channels, consolidation-on-write so the archive stays clean, and a retrieval command that surfaces what's relevant for a given prompt.
 
-A single script. No gems. No API keys. Ollama runs locally for embeddings and extraction.
+A single script. Ruby stdlib plus the sqlite3 gem. No other gems, no API keys. Ollama runs locally for embeddings and extraction.
 
 ---
 
@@ -58,6 +58,10 @@ bin/crib init
 # Check all prerequisites
 bin/crib doctor
 # { "ruby": { "version": "3.x", "ok": true }, ... "ok": true }
+
+# Run memory maintenance — contradiction detection, correction linking, staleness
+bin/crib maintain
+# {"contradictions_found":1,"corrections_linked":0,"stale_count":3,"supersessions_applied":1}
 ```
 
 ### Entry types
@@ -70,13 +74,13 @@ The optional `type=` prefix on write categorizes entries:
 | `decision` | A choice made and why |
 | `correction` | Something previously believed that turned out wrong |
 | `error` | A failure that occurred and what was learned |
+| `interest` | A topic the agent is tracking for external intelligence |
 
 ### Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CRIB_DB` | `.state/crib/crib.db` | Path to the SQLite database |
-| `CRIB_SQLITE3` | auto-detected | Path to a sqlite3 binary with extension loading |
 | `CRIB_VEC_EXTENSION` | auto-detected | Path to the sqlite-vec `vec0` extension |
 | `CRIB_CHANNEL` | all channels | Isolate a single retrieval channel: `triples`, `fts`, or `vector` |
 | `CRIB_DISTANCE_METRIC` | `cosine` | Distance metric for vector search: `cosine` or `L2` |
@@ -150,7 +154,9 @@ CREATE TABLE entries (
   type TEXT NOT NULL,
   content TEXT NOT NULL,
   embedding BLOB,
-  created_at TEXT DEFAULT (datetime('now'))
+  created_at TEXT DEFAULT (datetime('now')),
+  last_retrieved_at TEXT,
+  superseded_by INTEGER
 );
 
 CREATE VIRTUAL TABLE entries_fts USING fts5(
@@ -221,7 +227,7 @@ Tests run against a temporary database that is created and destroyed on each run
 ## Prerequisites
 
 - Ruby 3.x
-- SQLite 3.x with extension loading enabled (Homebrew's `sqlite` — the macOS system sqlite3 has extension loading disabled)
+- Ruby sqlite3 gem (handles extension loading natively — no Homebrew sqlite3 binary needed)
 - [sqlite-vec](https://github.com/asg017/sqlite-vec) (`pip3 install sqlite-vec`)
 - [Ollama](https://ollama.com) with the default models pulled (see below)
 
