@@ -241,7 +241,7 @@ rescue SQLite3::Exception => e
 end
 
 def sql_query(db, query, params = [])
-  db.execute(query, params)
+  db.execute(query, params).map(&:dup)
 rescue SQLite3::Exception => e
   spill_log(:error, "sqlite3 error: #{e.message}")
   []
@@ -885,7 +885,7 @@ def cmd_maintain
         AND last_retrieved_at IS NOT NULL
         AND last_retrieved_at < datetime('now', '-' || ? || ' days');
     SQL
-    stale_count = stale.first['cnt'] if stale.any?
+    stale_count = stale.first&.[]('cnt') || 0
   rescue => e
     spill_log(:error, "staleness check failed: #{e.message}")
   end
