@@ -1,0 +1,401 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# test/smoke-test — end-to-end verification of crib memory storage and retrieval
+#
+# Usage:
+#   test/smoke-test           # fast: skips vector and triple extraction tests
+#   test/smoke-test --full    # includes real ollama (embeddings, extraction)
+#
+# Dependencies: ruby, sqlite3 gem, sqlite-vec, ollama (only with --full)
+#
+# Behavior:
+#   1. Tests structure and syntax
+#   2. Tests doctor, init, and database schema
+#   3. Tests write (basic, typed, empty rejection)
+#   4. Tests retrieve (FTS round-trip, empty input, missing DB, memory tags)
+#   5. Tests maintain (JSON output with expected keys)
+#   6. Tests vector and triple extraction (--full only)
+#   7. Reports pass/fail/skip, exits 0/1
+
+require_relative '../../prophet/test/lib/test_harness'
+include TestHarness
+
+require 'open3'
+require 'json'
+require 'tmpdir'
+require 'fileutils'
+
+CRIB_ROOT = File.expand_path('..', __dir__)
+CRIB_BIN  = File.join(CRIB_ROOT, 'bin', 'crib')
+SQLITE3   = ENV['SQLITE3'] || '/opt/homebrew/opt/sqlite/bin/sqlite3'
+
+tmpdir = Dir.mktmpdir('crib-test')
+test_db = File.join(tmpdir, 'test.db')
+
+at_exit { FileUtils.rm_rf(tmpdir) }
+
+# Base environment for subprocess calls — points at the temporary database
+# and preserves OLLAMA_HOST / PATH for shim interception.
+env = { 'CRIB_DB' => test_db }
+
+# ---------------------------------------------------------------------------
+# Structure
+# ---------------------------------------------------------------------------
+
+section 'Structure'
+
+if File.exist?(CRIB_BIN)
+  pass 'bin/crib exists'
+else
+  fail 'bin/crib', 'not found'
+end
+
+if File.executable?(CRIB_BIN)
+  pass 'bin/crib is executable'
+else
+  fail 'bin/crib', 'not executable'
+end
+
+# ---------------------------------------------------------------------------
+# Syntax
+# ---------------------------------------------------------------------------
+
+section 'Syntax'
+
+_, status = Open3.capture2('ruby', '-c', CRIB_BIN, err: File::NULL)
+if status.success?
+  pass 'bin/crib passes syntax check'
+else
+  fail 'bin/crib syntax', 'syntax error'
+end
+
+# ---------------------------------------------------------------------------
+# Doctor
+# ---------------------------------------------------------------------------
+
+section 'Doctor'
+
+doctor_out, doctor_status = Open3.capture2(env, 'ruby', CRIB_BIN, 'doctor')
+begin
+  data = JSON.parse(doctor_out)
+  if doctor_status.success?
+    pass 'Doctor reports all prerequisites OK'
+  else
+    pass 'Doctor exits with valid JSON (some prerequisites missing in mock mode)'
+  end
+rescue JSON::ParserError
+  fail 'Doctor', "output is not valid JSON: #{doctor_out}"
+rescue => e
+  fail 'Doctor', "exited with #{doctor_status.exitstatus}: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
+# Init
+# ---------------------------------------------------------------------------
+
+section 'Init'
+
+init_out, init_err, init_status = Open3.capture3(env, 'ruby', CRIB_BIN, 'init')
+if init_status.success?
+  pass 'crib init exits 0'
+else
+  fail 'crib init', "exited with #{init_status.exitstatus}: #{init_err}"
+end
+
+if File.exist?(test_db)
+  pass 'Database file exists after init'
+else
+  fail 'Database file', "not created at #{test_db}"
+end
+
+# Verify expected tables
+tables_out, = Open3.capture2(SQLITE3, test_db, '.tables')
+expected_tables = %w[entries entities relations sources entries_fts]
+missing_tables = expected_tables.reject { |t| tables_out.include?(t) }
+if missing_tables.empty?
+  pass 'Database has all expected tables (entries, entities, relations, sources, entries_fts)'
+else
+  fail 'Database tables', "missing: #{missing_tables.join(', ')}"
+end
+
+# ---------------------------------------------------------------------------
+# Write
+# ---------------------------------------------------------------------------
+
+section 'Write'
+
+# Fresh DB for write tests
+FileUtils.rm_f(test_db)
+
+# Basic write
+write_out, write_err, write_status = Open3.capture3(
+  env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=note Smoke test entry for crib\n"
+)
+if write_status.success? && write_err.include?('stored entry')
+  pass 'Write stores a note and reports success'
+else
+  fail 'Write basic', "expected 'stored entry' in stderr, got: #{write_err}"
+end
+
+# Write with type=decision
+decision_out, decision_err, decision_status = Open3.capture3(
+  env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=decision Chose SQLite for storage\n"
+)
+if decision_status.success? && decision_err.include?('stored entry') && decision_err.include?('decision')
+  pass 'Write respects type=decision prefix'
+else
+  fail 'Write type', "expected 'stored entry' and 'decision' in stderr, got: #{decision_err}"
+end
+
+# Write rejects empty input
+_, empty_err, empty_status = Open3.capture3(
+  env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "\n"
+)
+if !empty_status.success?
+  pass 'Write rejects empty input (nonzero exit)'
+else
+  fail 'Write empty', 'expected nonzero exit, got 0'
+end
+
+# ---------------------------------------------------------------------------
+# Retrieve — FTS round-trip
+# ---------------------------------------------------------------------------
+
+section 'Retrieve'
+
+# Write a distinctive entry, then retrieve it via FTS
+fts_db = File.join(tmpdir, 'fts.db')
+fts_env = env.merge('CRIB_DB' => fts_db)
+
+# Init the FTS database first
+Open3.capture3(fts_env, 'ruby', CRIB_BIN, 'init')
+
+Open3.capture3(
+  fts_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=decision Chose bananaphone as the primary communication device\n"
+)
+
+fts_out, = Open3.capture2(
+  fts_env.merge('CRIB_CHANNEL' => 'fts'), 'ruby', CRIB_BIN, 'retrieve',
+  stdin_data: "bananaphone communication\n",
+  err: File::NULL
+)
+if fts_out.include?('bananaphone')
+  pass 'FTS round-trip: write then retrieve finds written content'
+else
+  fail 'FTS round-trip', "expected 'bananaphone' in output, got: #{fts_out}"
+end
+
+# Retrieve with empty input exits 0
+_, _, empty_retrieve_status = Open3.capture3(
+  env, 'ruby', CRIB_BIN, 'retrieve',
+  stdin_data: "\n"
+)
+if empty_retrieve_status.success?
+  pass 'Retrieve with empty input exits 0'
+else
+  fail 'Retrieve empty', "expected exit 0, got #{empty_retrieve_status.exitstatus}"
+end
+
+# Retrieve wraps output in <memory> tags
+if fts_out.include?('<memory') && fts_out.include?('</memory>')
+  pass 'Retrieve wraps output in <memory> tags'
+else
+  fail 'Retrieve tags', 'output missing <memory>...</memory> wrapper'
+end
+
+# Retrieve with missing DB exits 0 (fail-open)
+missing_db = File.join(tmpdir, 'nonexistent.db')
+_, _, missing_status = Open3.capture3(
+  env.merge('CRIB_DB' => missing_db), 'ruby', CRIB_BIN, 'retrieve',
+  stdin_data: "test query\n",
+  err: File::NULL
+)
+if missing_status.success?
+  pass 'Retrieve with missing database exits 0 (fail-open)'
+else
+  fail 'Retrieve no DB', "expected exit 0, got #{missing_status.exitstatus}"
+end
+
+# ---------------------------------------------------------------------------
+# Maintain
+# ---------------------------------------------------------------------------
+
+section 'Maintain'
+
+maintain_out, _, maintain_status = Open3.capture3(
+  fts_env, 'ruby', CRIB_BIN, 'maintain',
+  err: File::NULL
+)
+if !maintain_status.success?
+  fail 'crib maintain', "exited with #{maintain_status.exitstatus}"
+else
+  begin
+    mdata = JSON.parse(maintain_out)
+    expected_keys = %w[contradictions_found corrections_linked stale_count]
+    missing_keys = expected_keys.reject { |k| mdata.key?(k) }
+    if missing_keys.empty?
+      pass 'Maintain exits 0 with expected JSON keys (contradictions_found, corrections_linked, stale_count)'
+    else
+      fail 'Maintain keys', "missing: #{missing_keys.join(', ')}"
+    end
+  rescue JSON::ParserError
+    fail 'Maintain JSON', 'output is not valid JSON'
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Decay
+# ---------------------------------------------------------------------------
+
+section 'Decay'
+
+# Decay pruning: write a note, backdate it 200 days, run maintain, confirm superseded_by = -1
+decay_db = File.join(tmpdir, 'decay.db')
+decay_env = env.merge('CRIB_DB' => decay_db)
+
+Open3.capture3(decay_env, 'ruby', CRIB_BIN, 'init')
+Open3.capture3(
+  decay_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=note Ephemeral thought about yesterday's weather\n"
+)
+
+# Backdate the entry's timestamps well beyond the half-life
+Open3.capture2(SQLITE3, decay_db,
+  "UPDATE entries SET created_at = datetime('now', '-200 days'), last_retrieved_at = datetime('now', '-200 days') WHERE id = (SELECT MAX(id) FROM entries);")
+
+decay_out, _, decay_status = Open3.capture3(
+  decay_env, 'ruby', CRIB_BIN, 'maintain',
+  err: File::NULL
+)
+if decay_status.success?
+  decay_data = JSON.parse(decay_out)
+  # Check that the entry was decayed
+  superseded_out, = Open3.capture2(SQLITE3, decay_db,
+    "SELECT superseded_by FROM entries WHERE id = (SELECT MAX(id) FROM entries);")
+  if superseded_out.strip == '-1' && decay_data['decayed_count'].to_i > 0
+    pass 'Decay pruning marks old entries with superseded_by = -1'
+  else
+    fail 'Decay pruning', "expected superseded_by=-1 and decayed_count>0, got superseded_by=#{superseded_out.strip}, decayed_count=#{decay_data['decayed_count']}"
+  end
+else
+  fail 'Decay pruning', "maintain exited with #{decay_status.exitstatus}"
+end
+
+# Dry-run: write a note, backdate it, run maintain --dry-run, confirm NOT pruned but decayed_count > 0
+dryrun_db = File.join(tmpdir, 'dryrun.db')
+dryrun_env = env.merge('CRIB_DB' => dryrun_db)
+
+Open3.capture3(dryrun_env, 'ruby', CRIB_BIN, 'init')
+Open3.capture3(
+  dryrun_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=note Temporary observation about dry run testing\n"
+)
+
+Open3.capture2(SQLITE3, dryrun_db,
+  "UPDATE entries SET created_at = datetime('now', '-200 days'), last_retrieved_at = datetime('now', '-200 days') WHERE id = (SELECT MAX(id) FROM entries);")
+
+dryrun_out, _, dryrun_status = Open3.capture3(
+  dryrun_env, 'ruby', CRIB_BIN, 'maintain', '--dry-run',
+  err: File::NULL
+)
+if dryrun_status.success?
+  dryrun_data = JSON.parse(dryrun_out)
+  superseded_out, = Open3.capture2(SQLITE3, dryrun_db,
+    "SELECT superseded_by FROM entries WHERE id = (SELECT MAX(id) FROM entries);")
+  if superseded_out.strip == '' && dryrun_data['decayed_count'].to_i > 0 && dryrun_data['dry_run'] == true
+    pass 'Dry-run reports decayed_count but does not prune'
+  else
+    fail 'Dry-run', "expected NULL superseded_by and decayed_count>0 and dry_run=true, got superseded_by=#{superseded_out.strip.inspect}, decayed_count=#{dryrun_data['decayed_count']}, dry_run=#{dryrun_data['dry_run']}"
+  end
+else
+  fail 'Dry-run', "maintain --dry-run exited with #{dryrun_status.exitstatus}"
+end
+
+# Grace period: write a note, backdate it just 3 days (within 7-day grace), run maintain, confirm it survives
+grace_db = File.join(tmpdir, 'grace.db')
+grace_env = env.merge('CRIB_DB' => grace_db)
+
+Open3.capture3(grace_env, 'ruby', CRIB_BIN, 'init')
+Open3.capture3(
+  grace_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=note Recent thought within grace period\n"
+)
+
+Open3.capture2(SQLITE3, grace_db,
+  "UPDATE entries SET created_at = datetime('now', '-3 days'), last_retrieved_at = datetime('now', '-3 days') WHERE id = (SELECT MAX(id) FROM entries);")
+
+grace_out, _, grace_status = Open3.capture3(
+  grace_env, 'ruby', CRIB_BIN, 'maintain',
+  err: File::NULL
+)
+if grace_status.success?
+  grace_data = JSON.parse(grace_out)
+  superseded_out, = Open3.capture2(SQLITE3, grace_db,
+    "SELECT superseded_by FROM entries WHERE id = (SELECT MAX(id) FROM entries);")
+  if superseded_out.strip == '' && grace_data['decayed_count'].to_i == 0
+    pass 'Grace period protects recent entries from decay'
+  else
+    fail 'Grace period', "expected NULL superseded_by and decayed_count=0, got superseded_by=#{superseded_out.strip.inspect}, decayed_count=#{grace_data['decayed_count']}"
+  end
+else
+  fail 'Grace period', "maintain exited with #{grace_status.exitstatus}"
+end
+
+# ---------------------------------------------------------------------------
+# Vector tests (--full only)
+# ---------------------------------------------------------------------------
+
+section 'Vector'
+
+if full?
+  vec_db = File.join(tmpdir, 'vec.db')
+  vec_env = env.merge('CRIB_DB' => vec_db)
+
+  Open3.capture3(
+    vec_env, 'ruby', CRIB_BIN, 'write',
+    stdin_data: "type=decision Chose zephyr turbines for wind energy conversion\n"
+  )
+
+  _, _, vec_status = Open3.capture3(
+    vec_env.merge('CRIB_CHANNEL' => 'vector'), 'ruby', CRIB_BIN, 'retrieve',
+    stdin_data: "wind energy turbines\n",
+    err: File::NULL
+  )
+  if vec_status.success?
+    pass 'Vector retrieval completes without error'
+  else
+    fail 'Vector retrieval', "exited with #{vec_status.exitstatus}"
+  end
+else
+  skip 'Vector write-retrieve round-trip', 'requires ollama (use --full)'
+end
+
+# ---------------------------------------------------------------------------
+# Triple extraction (--full only)
+# ---------------------------------------------------------------------------
+
+section 'Triple extraction'
+
+if full?
+  triple_db = File.join(tmpdir, 'triple.db')
+  triple_env = env.merge('CRIB_DB' => triple_db)
+
+  _, triple_err, triple_status = Open3.capture3(
+    triple_env, 'ruby', CRIB_BIN, 'write',
+    stdin_data: "type=decision PostgreSQL is the database for the billing system\n"
+  )
+  if triple_status.success? && triple_err.include?('triples extracted')
+    pass 'Write extracts triples via ollama'
+  else
+    fail 'Triple extraction', "expected 'triples extracted' in stderr, got: #{triple_err}"
+  end
+else
+  skip 'Triple extraction via ollama', 'requires ollama (use --full)'
+end
+
+finish!

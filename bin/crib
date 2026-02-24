@@ -54,7 +54,7 @@
 #   write     — status on stderr, nothing on stdout
 #   retrieve  — <memory context_time="...">...</memory> on stdout (empty = nothing relevant)
 #   init      — status on stderr
-#   maintain  — JSON on stdout: {"contradictions_found":N,"corrections_linked":N,"stale_count":N,"supersessions_applied":N}
+#   maintain  — JSON on stdout: {"contradictions_found":N,"corrections_linked":N,"stale_count":N,"supersessions_applied":N,"decayed_count":N,"dry_run":bool,"min_decay_score":F}
 #
 # Dependencies: Ruby stdlib plus the sqlite3 gem. No other gems.
 #               External: sqlite-vec (extension), ollama
@@ -93,6 +93,7 @@ require 'open3'
 require 'net/http'
 require 'fileutils'
 require 'uri'
+require 'time'
 require 'sqlite3'
 
 SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
@@ -131,6 +132,19 @@ TOKEN_BUDGET = 2000
 CHAR_BUDGET = TOKEN_BUDGET * 4
 
 STALENESS_DAYS = 30
+
+# Base half-lives by entry type (days)
+HALF_LIFE = {
+  'decision'    => ENV.fetch('CRIB_HALF_LIFE_DECISION',   '90').to_i,
+  'correction'  => ENV.fetch('CRIB_HALF_LIFE_CORRECTION', '60').to_i,
+  'error'       => ENV.fetch('CRIB_HALF_LIFE_ERROR',      '30').to_i,
+  'note'        => ENV.fetch('CRIB_HALF_LIFE_NOTE',       '14').to_i,
+  'interest'    => ENV.fetch('CRIB_HALF_LIFE_INTEREST',    '7').to_i,
+}.freeze
+
+DECAY_ARCHIVE_THRESHOLD = ENV.fetch('CRIB_DECAY_THRESHOLD', '0.05').to_f
+RETRIEVAL_BOOST         = ENV.fetch('CRIB_RETRIEVAL_BOOST', '0.15').to_f
+GRACE_PERIOD_DAYS       = ENV.fetch('CRIB_GRACE_PERIOD',    '7').to_i
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -247,6 +261,21 @@ rescue SQLite3::Exception => e
   []
 end
 
+# vec0 virtual tables report fewer columns than a SELECT rowid, distance
+# query actually returns, which breaks results_as_hash. Query with hash
+# mode off and zip the column names manually.
+def sql_query_vec(db, query, columns, params = [])
+  saved = db.results_as_hash
+  db.results_as_hash = false
+  rows = db.execute(query, params)
+  rows.map { |row| columns.zip(row).to_h }
+rescue SQLite3::Exception => e
+  spill_log(:error, "sqlite3 error: #{e.message}")
+  []
+ensure
+  db.results_as_hash = saved
+end
+
 def sql_insert_returning_id(db, query, params = [])
   db.execute(query, params)
   db.last_insert_row_id
@@ -292,6 +321,9 @@ def run_migrations(db)
   end
   unless has_column?(db, 'entries', 'superseded_by')
     db.execute("ALTER TABLE entries ADD COLUMN superseded_by INTEGER;")
+  end
+  unless has_column?(db, 'entries', 'retrieval_count')
+    db.execute("ALTER TABLE entries ADD COLUMN retrieval_count INTEGER DEFAULT 0")
   end
 rescue SQLite3::Exception => e
   spill_log(:error, "migration error: #{e.message}")
@@ -406,9 +438,17 @@ end
 def store_embedding(vec_db, entry_id, embedding)
   return if embedding.nil? || entry_id.nil? || vec_db.nil?
   json_vec = JSON.generate(embedding)
-  sql_exec(vec_db,
+  # vec0 virtual tables break results_as_hash — disable it for the INSERT
+  saved = vec_db.results_as_hash
+  vec_db.results_as_hash = false
+  vec_db.execute(
     "INSERT INTO entries_vec(rowid, embedding) VALUES (?, ?);",
     [entry_id, json_vec])
+rescue SQLite3::Exception => e
+  spill_log(:error, "sqlite3 error: #{e.message}")
+  nil
+ensure
+  vec_db.results_as_hash = saved if vec_db
 end
 
 def cmd_write
@@ -522,7 +562,7 @@ def query_vector(vec_db, prompt)
   return [] if embedding.nil?
 
   json_vec = JSON.generate(embedding)
-  vec_results = sql_query(vec_db, <<~SQL, [json_vec])
+  vec_results = sql_query_vec(vec_db, <<~SQL, %w[rowid distance], [json_vec])
     SELECT rowid, distance
     FROM entries_vec
     WHERE embedding MATCH ?
@@ -671,10 +711,11 @@ end
 
 def update_last_retrieved(db, entry_ids)
   return if entry_ids.empty?
-  placeholders = entry_ids.map { '?' }.join(',')
-  sql_exec(db,
-    "UPDATE entries SET last_retrieved_at = datetime('now') WHERE id IN (#{placeholders});",
-    entry_ids)
+  entry_ids.each do |id|
+    sql_exec(db,
+      "UPDATE entries SET last_retrieved_at = datetime('now'), retrieval_count = COALESCE(retrieval_count, 0) + 1 WHERE id = ?;",
+      [id])
+  end
 end
 
 def cmd_retrieve
@@ -775,8 +816,10 @@ rescue => e
 end
 
 def cmd_maintain
+  dry_run = ARGV.include?('--dry-run')
+
   unless db_exists?
-    puts JSON.generate({ contradictions_found: 0, corrections_linked: 0, stale_count: 0, supersessions_applied: 0 })
+    puts JSON.generate({ contradictions_found: 0, corrections_linked: 0, stale_count: 0, supersessions_applied: 0, decayed_count: 0, dry_run: dry_run, min_decay_score: 1.0 })
     exit 0
   end
 
@@ -843,7 +886,7 @@ def cmd_maintain
       next if embedding.nil? || vec_db.nil?
 
       json_vec = JSON.generate(embedding)
-      candidates = sql_query(vec_db, <<~SQL, [json_vec, correction['id']])
+      candidates = sql_query_vec(vec_db, <<~SQL, %w[rowid distance], [json_vec])
         SELECT rowid, distance
         FROM entries_vec
         WHERE embedding MATCH ?
@@ -890,13 +933,44 @@ def cmd_maintain
     spill_log(:error, "staleness check failed: #{e.message}")
   end
 
+  # --- Ebbinghaus decay pruning ---
+  decayed_count = 0
+  min_decay = 1.0
+  begin
+    active_entries = sql_query(db,
+      "SELECT id, type, created_at, last_retrieved_at, COALESCE(retrieval_count, 0) as rc " \
+      "FROM entries WHERE superseded_by IS NULL AND created_at < datetime('now', '-' || ? || ' days')",
+      [GRACE_PERIOD_DAYS])
+
+    active_entries.each do |entry|
+      last_access = entry['last_retrieved_at'] || entry['created_at']
+      elapsed = (Time.now.utc - Time.parse(last_access)).to_f / 86400.0
+      base_hl = HALF_LIFE.fetch(entry['type'], HALF_LIFE['note'])
+      eff_hl = base_hl * (1.0 + RETRIEVAL_BOOST * Math.log(1.0 + entry['rc']))
+      decay = Math.exp(-elapsed * Math.log(2) / eff_hl)
+      min_decay = decay if decay < min_decay
+
+      if decay < DECAY_ARCHIVE_THRESHOLD
+        unless dry_run
+          sql_exec(db, "UPDATE entries SET superseded_by = -1 WHERE id = ? AND superseded_by IS NULL", [entry['id']])
+        end
+        decayed_count += 1
+      end
+    end
+  rescue => e
+    spill_log(:error, "decay pruning failed: #{e.message}")
+  end
+
   db.close
 
   result = {
     contradictions_found: contradictions_found,
     corrections_linked: corrections_linked,
     stale_count: stale_count,
-    supersessions_applied: supersessions_applied
+    supersessions_applied: supersessions_applied,
+    decayed_count: decayed_count,
+    dry_run: dry_run,
+    min_decay_score: min_decay.round(4)
   }
 
   spill_log(:info, "maintain complete", **result)
