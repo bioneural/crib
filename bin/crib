@@ -15,7 +15,9 @@
 #   crib retrieve  Query memory and return relevant context
 #   crib init      Initialize the database (run automatically on first write)
 #   crib doctor    Check all prerequisites and report status (JSON on stdout)
-#   crib maintain  Run contradiction detection, correction linking, and staleness (JSON on stdout)
+#   crib maintain  Run maintenance (correction linking + decay only)
+#                  --full     Also run contradiction detection and staleness tracking
+#                  --dry-run  Report what would change without modifying data
 #
 # Usage:
 #   echo "Chose SQLite for storage" | bin/crib write
@@ -817,6 +819,7 @@ end
 
 def cmd_maintain
   dry_run = ARGV.include?('--dry-run')
+  full = ARGV.include?('--full')
 
   unless db_exists?
     puts JSON.generate({ contradictions_found: 0, corrections_linked: 0, stale_count: 0, supersessions_applied: 0, decayed_count: 0, dry_run: dry_run, min_decay_score: 1.0 })
@@ -834,6 +837,7 @@ def cmd_maintain
   # --- Contradiction detection ---
   # Compare recent entries pairwise via FTS5 similarity. For each pair
   # with matching terms, call classify to confirm a contradiction.
+  if full
   begin
     recent = sql_query(db,
       "SELECT id, content FROM entries WHERE superseded_by IS NULL ORDER BY created_at DESC LIMIT 50;")
@@ -871,6 +875,7 @@ def cmd_maintain
   rescue => e
     spill_log(:error, "contradiction detection failed: #{e.message}")
   end
+  end # full
 
   # --- Correction linking ---
   # Find type=correction entries without a supersession link, then find
@@ -921,6 +926,7 @@ def cmd_maintain
   end
 
   # --- Staleness tracking ---
+  if full
   begin
     stale = sql_query(db, <<~SQL, [STALENESS_DAYS])
       SELECT COUNT(*) AS cnt FROM entries
@@ -932,6 +938,7 @@ def cmd_maintain
   rescue => e
     spill_log(:error, "staleness check failed: #{e.message}")
   end
+  end # full
 
   # --- Ebbinghaus decay pruning ---
   decayed_count = 0
@@ -1074,7 +1081,8 @@ def usage
       retrieve  Query memory for relevant context (stdin)
       init      Initialize the database
       doctor    Check prerequisites and report status (JSON)
-      maintain  Run contradiction detection, correction linking, and staleness (JSON)
+      maintain  Run maintenance: correction linking + decay (JSON)
+                --full adds contradiction detection and staleness tracking
 
     Environment:
       CRIB_DB   Path to SQLite database (default: .state/crib/crib.db)
