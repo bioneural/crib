@@ -142,6 +142,7 @@ HALF_LIFE = {
   'error'       => ENV.fetch('CRIB_HALF_LIFE_ERROR',      '30').to_i,
   'note'        => ENV.fetch('CRIB_HALF_LIFE_NOTE',       '14').to_i,
   'interest'    => ENV.fetch('CRIB_HALF_LIFE_INTEREST',    '7').to_i,
+  'preference'  => ENV.fetch('CRIB_HALF_LIFE_PREFERENCE','120').to_i,
 }.freeze
 
 DECAY_ARCHIVE_THRESHOLD = ENV.fetch('CRIB_DECAY_THRESHOLD', '0.05').to_f
@@ -638,6 +639,12 @@ def format_entries(entries)
   "## Memory entries\n\n#{lines.join("\n")}"
 end
 
+def format_preferences(entries)
+  return '' if entries.empty?
+  lines = entries.map { |e| "- #{e['content']}" }
+  "## Active preferences\n\n#{lines.join("\n")}"
+end
+
 def cross_encoder_rerank(prompt, entries)
   return entries if entries.empty?
 
@@ -774,17 +781,32 @@ def cmd_retrieve
 
   all_entries = cross_encoder_rerank(prompt, all_entries) if all_entries.any?
 
-  # Track access times on returned entries
+  # Dispositional: always surface active preferences regardless of query
+  # Only inject when running all channels (no channel isolation)
+  pref_entries = []
+  unless channel
+    pref_limit = ENV.fetch('CRIB_PREF_LIMIT', '5').to_i
+    pref_entries = sql_query(db,
+      "SELECT id, type, content, created_at FROM entries " \
+      "WHERE type = 'preference' AND superseded_by IS NULL " \
+      "ORDER BY created_at DESC LIMIT ?;",
+      [pref_limit])
+    existing_ids = all_entries.map { |e| e['id'] }
+    pref_entries.reject! { |p| existing_ids.include?(p['id']) }
+  end
+
+  # Track access times on returned entries + preference entries
   retrieved_ids = all_entries.map { |e| e['id'] }.compact
-  update_last_retrieved(db, retrieved_ids)
+  update_last_retrieved(db, retrieved_ids + pref_entries.map { |e| e['id'] }.compact)
 
   db.close
   vec_db&.close
 
   triples_text = format_triples(triples)
   entries_text = format_entries(all_entries)
+  prefs_text = format_preferences(pref_entries)
 
-  combined = [triples_text, entries_text].reject(&:empty?).join("\n\n")
+  combined = [triples_text, entries_text, prefs_text].reject(&:empty?).join("\n\n")
   exit 0 if combined.empty?
 
   combined = truncate(combined, CHAR_BUDGET)
