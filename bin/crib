@@ -1083,7 +1083,28 @@ def cmd_doctor
     'exists' => File.exist?(DB_PATH)
   }
 
+  # Probe
+  if ARGV.include?('--probe')
+    begin
+      require 'tmpdir'
+      probe_db = File.join(Dir.tmpdir, "crib-probe-#{$$}.db")
+      probe_env = { 'CRIB_DB' => probe_db }
+      Open3.capture2e(probe_env, 'ruby', __FILE__, 'init')
+      Open3.capture2e(probe_env, 'ruby', __FILE__, 'write', stdin_data: 'type=note doctor probe test')
+      output, = Open3.capture2(probe_env.merge('CRIB_CHANNEL' => 'fts'), 'ruby', __FILE__, 'retrieve',
+        stdin_data: 'doctor probe test', err: File::NULL)
+      has_xml = output.include?('<memory context_time=')
+      report['probe'] = { 'ok' => true }
+      report['probe']['warn'] = 'retrieve output missing expected XML shape' unless has_xml
+    rescue => e
+      report['probe'] = { 'ok' => true, 'warn' => "probe error: #{e.message}" }
+    ensure
+      FileUtils.rm_f(probe_db) if probe_db
+    end
+  end
+
   # Overall
+  report['protocol_version'] = 1
   report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
 
   puts JSON.pretty_generate(report)
