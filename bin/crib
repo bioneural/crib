@@ -522,6 +522,9 @@ end
 def query_triples(db, keywords)
   return [] if keywords.empty?
 
+  # Cap to avoid exceeding SQLite's expression tree depth limit (1000).
+  keywords = keywords.first(50)
+
   like_clauses = keywords.map { "name LIKE '%' || ? || '%'" }.join(' OR ')
 
   sql_query(db, <<~SQL, keywords + keywords)
