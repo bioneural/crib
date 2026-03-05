@@ -815,8 +815,14 @@ def cmd_retrieve
 
   combined = truncate(combined, CHAR_BUDGET)
 
-  context_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-  puts "<memory context_time=\"#{context_time}\">\n#{combined}\n</memory>"
+  retrieved = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+  entry_count = triples.size + all_entries.size + pref_entries.size
+  preamble = "These are memories from previous sessions retrieved by relevance to " \
+    "the current context. Types: decision (a choice and why), correction (something " \
+    "previously wrong), error (a failure and what was learned), note (general " \
+    "knowledge), preference (an active behavioral directive). Timestamps are UTC. " \
+    "Newer entries supersede older ones on the same topic."
+  puts "<memory retrieved=\"#{retrieved}\" entries=\"#{entry_count}\">\n#{preamble}\n\n#{combined}\n</memory>"
 end
 
 # ---------------------------------------------------------------------------

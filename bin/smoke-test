@@ -233,20 +233,35 @@ test_retrieve_memory_tags() {
 }
 test_retrieve_memory_tags
 
-test_retrieve_context_time() {
+test_retrieve_metadata() {
   local output
   output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
   if [[ -n "$output" ]]; then
-    if echo "$output" | grep -qE '<memory context_time="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z">'; then
-      pass "Retrieve includes context_time on <memory> tag"
+    if echo "$output" | grep -qE '<memory retrieved="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z" entries="[0-9]+">'; then
+      pass "Retrieve includes retrieved and entries attributes on <memory> tag"
     else
-      fail "Retrieve context_time" "expected context_time attribute, got: $(echo "$output" | head -1)"
+      fail "Retrieve metadata" "expected retrieved and entries attributes, got: $(echo "$output" | head -1)"
     fi
   else
     pass "Retrieve returns empty for no match (fail-open)"
   fi
 }
-test_retrieve_context_time
+test_retrieve_metadata
+
+test_retrieve_preamble() {
+  local output
+  output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
+  if [[ -n "$output" ]]; then
+    if echo "$output" | grep -q "These are memories from previous sessions"; then
+      pass "Retrieve includes preamble paragraph"
+    else
+      fail "Retrieve preamble" "expected preamble text in output"
+    fi
+  else
+    pass "Retrieve returns empty for no match (fail-open)"
+  fi
+}
+test_retrieve_preamble
 
 test_retrieve_entry_timestamps() {
   local output
