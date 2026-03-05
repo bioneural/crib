@@ -614,9 +614,10 @@ def rrf_merge(fts_entries, vector_entries, k: RRF_K, limit: RRF_LIMIT)
   sorted.first(limit).map { |id, _score| entry_by_id[id] }
 end
 
-def format_date(datetime_str)
+def format_datetime(datetime_str)
   return nil if datetime_str.nil? || datetime_str.empty?
-  datetime_str[0, 10] # YYYY-MM-DD from "YYYY-MM-DD HH:MM:SS"
+  # SQLite stores "YYYY-MM-DD HH:MM:SS" — convert to ISO 8601 UTC
+  datetime_str.sub(' ', 'T') + 'Z'
 rescue
   nil
 end
@@ -625,7 +626,7 @@ def format_triples(triples)
   return '' if triples.empty?
   sorted = triples.sort_by { |t| t['valid_from'] || '' }.reverse
   lines = sorted.map do |t|
-    since = format_date(t['valid_from'])
+    since = format_datetime(t['valid_from'])
     since_str = since ? " (since #{since})" : ''
     "- #{t['subject']} → #{t['predicate']} → #{t['object']}#{since_str}"
   end
@@ -635,7 +636,7 @@ end
 def format_entries(entries)
   return '' if entries.empty?
   lines = entries.map do |e|
-    date = format_date(e['created_at'])
+    date = format_datetime(e['created_at'])
     prefix = date ? "#{date} #{e['type']}" : e['type']
     "- [#{prefix}] #{e['content']}"
   end
