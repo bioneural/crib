@@ -226,6 +226,7 @@ def open_db
   spill_log(:debug, "opening database at #{DB_PATH}")
   db = SQLite3::Database.new(DB_PATH)
   db.busy_timeout = 5000
+  db.execute('PRAGMA journal_mode=WAL')
   db.results_as_hash = true
   db
 end

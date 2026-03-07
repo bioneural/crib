@@ -119,6 +119,14 @@ else
   fail 'Database tables', "missing: #{missing_tables.join(', ')}"
 end
 
+# Verify WAL mode
+wal_out, = Open3.capture2(SQLITE3, test_db, 'PRAGMA journal_mode;')
+if wal_out.strip == 'wal'
+  pass 'Database uses WAL journal mode'
+else
+  fail 'WAL mode', "expected wal, got #{wal_out.strip}"
+end
+
 # ---------------------------------------------------------------------------
 # Write
 # ---------------------------------------------------------------------------
