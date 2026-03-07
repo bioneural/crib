@@ -114,6 +114,14 @@ echo "type=decision Switched from Postgres to SQLite" | bin/crib write
 
 There is no automatic write policy. What to store is a judgment call that belongs to the agent, not to hook plumbing.
 
+### WAL mode
+
+crib uses SQLite WAL (Write-Ahead Logging) mode for concurrent write safety. Multiple formation channels — escort extraction, blog reflection, operator feedback, diagnose findings — may write to crib concurrently. WAL allows concurrent readers during writes without blocking.
+
+### Write-time dedup
+
+Before storing a new entry, crib checks for identical content written in the last hour via FTS5. If an exact duplicate is found, the write is skipped with a log message. This prevents duplicate entries from overlapping formation channels (escort and trick) writing the same knowledge.
+
 ---
 
 Crib's interface is stdin/stdout. Any agent framework that can pipe text to a command can use it — hooker is one integration path, not the only one.
