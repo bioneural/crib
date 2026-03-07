@@ -458,4 +458,45 @@ else
   skip 'Triple extraction via ollama', 'requires ollama (use --full)'
 end
 
+# ---------------------------------------------------------------------------
+# Write-time dedup
+# ---------------------------------------------------------------------------
+
+section 'Write-time dedup'
+
+dedup_db = File.join(tmpdir, 'dedup.db')
+dedup_env = env.merge('CRIB_DB' => dedup_db)
+
+Open3.capture3(dedup_env, 'ruby', CRIB_BIN, 'init')
+
+# Write same content twice
+Open3.capture3(
+  dedup_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=note Unique dedup test content for smoke testing\n"
+)
+Open3.capture3(
+  dedup_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=note Unique dedup test content for smoke testing\n"
+)
+
+dedup_count, = Open3.capture2(SQLITE3, dedup_db, 'SELECT COUNT(*) FROM entries;')
+if dedup_count.strip.to_i == 1
+  pass 'Write-time dedup: same content written twice produces one entry'
+else
+  fail 'Write-time dedup', "expected 1 entry, got #{dedup_count.strip}"
+end
+
+# Write different content — should produce two entries
+Open3.capture3(
+  dedup_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=note Completely different content for dedup testing\n"
+)
+
+dedup_count2, = Open3.capture2(SQLITE3, dedup_db, 'SELECT COUNT(*) FROM entries;')
+if dedup_count2.strip.to_i == 2
+  pass 'Write-time dedup: different content produces separate entries'
+else
+  fail 'Write-time dedup different', "expected 2 entries, got #{dedup_count2.strip}"
+end
+
 finish!

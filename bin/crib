@@ -484,6 +484,27 @@ def cmd_write
   init_db
 
   db = open_db
+
+  # Write-time dedup: check for substantially similar content written in the last hour
+  existing = db.get_first_value(
+    "SELECT COUNT(*) FROM entries_fts WHERE entries_fts MATCH ? AND rowid IN " \
+    "(SELECT id FROM entries WHERE created_at > datetime('now', '-1 hour'))",
+    [text.split(/\s+/).first(10).join(' ')]
+  ).to_i
+
+  if existing > 0
+    # Check for exact or near-exact match
+    recent = db.execute(
+      "SELECT content FROM entries WHERE created_at > datetime('now', '-1 hour') ORDER BY id DESC LIMIT 20"
+    )
+    duplicate = recent.any? { |r| r['content'] == text }
+    if duplicate
+      spill_log(:info, "write-time dedup: skipping duplicate content")
+      db.close
+      return
+    end
+  end
+
   entry_id = store_entry(db, type, text)
   if entry_id.nil?
     spill_log(:error, 'failed to store entry')
