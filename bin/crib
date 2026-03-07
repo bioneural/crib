@@ -49,6 +49,9 @@
 #                 score are filtered out. Default: 0.5 (the model must be
 #                 more confident "relevant" than "irrelevant"). Set to 0.0
 #                 to pass anything the model leans toward, or -1 to disable.
+#   CRIB_LOG_LEVEL
+#                 Minimum log level for stderr output: debug, info, warn, error.
+#                 Default: warn (production). Set to debug for detailed tracing.
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
@@ -97,9 +100,10 @@ require 'time'
 require 'sqlite3'
 
 SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
+LOG_LEVEL = ENV.fetch('CRIB_LOG_LEVEL', 'warn')
 if File.directory?(SPILL_HOME)
   require File.join(SPILL_HOME, 'lib', 'spill')
-  Spill.configure(tool: 'crib')
+  Spill.configure(tool: 'crib', level: LOG_LEVEL)
 end
 
 SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', __dir__)
@@ -219,6 +223,7 @@ SQL
 # ---------------------------------------------------------------------------
 
 def open_db
+  spill_log(:debug, "opening database at #{DB_PATH}")
   db = SQLite3::Database.new(DB_PATH)
   db.busy_timeout = 5000
   db.results_as_hash = true
@@ -240,10 +245,13 @@ end
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+LEVEL_RANK = { 'debug' => 0, 'info' => 1, 'warn' => 2, 'error' => 3 }.freeze
+
 def spill_log(level, msg, **ctx)
   if defined?(Spill)
     Spill.send(level, msg, **ctx)
   else
+    return if LEVEL_RANK.fetch(level.to_s, 0) < LEVEL_RANK.fetch(LOG_LEVEL, 2)
     $stderr.puts("crib: #{msg}")
   end
 end
@@ -345,6 +353,7 @@ def init_db
 end
 
 def ollama_embed(text)
+  spill_log(:debug, "embedding #{text.length} chars with #{EMBEDDING_MODEL}")
   uri = URI("#{OLLAMA_HOST}/api/embed")
   req = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
   req.body = JSON.generate({ model: EMBEDDING_MODEL, input: text })
@@ -380,6 +389,7 @@ def store_entry(db, type, content)
 end
 
 def extract_triples(text)
+  spill_log(:debug, "extracting triples with #{EXTRACTION_MODEL}")
   prompt = <<~PROMPT
     Extract factual relationships from the following text as JSON.
     Return a JSON array of objects, each with "subject", "predicate", "object", and "subject_type", "object_type" fields.
@@ -397,7 +407,9 @@ def extract_triples(text)
   json_str = result[/\[.*\]/m]
   return [] if json_str.nil?
 
-  JSON.parse(json_str)
+  triples = JSON.parse(json_str)
+  spill_log(:debug, "extracted #{triples.length} triples")
+  triples
 rescue JSON::ParserError
   spill_log(:error, 'failed to parse triple extraction response')
   []
@@ -466,6 +478,7 @@ def cmd_write
     type = text[/\Atype=(\w+)/, 1]
     text = text.sub(/\Atype=\w+\s+/, '')
   end
+  spill_log(:debug, "write: type=#{type}, #{text.length} chars")
 
   init_db
 
@@ -698,15 +711,17 @@ def rerank_score(prompt, document)
     no_lp = t['logprob'] if token == 'no' && no_lp.nil?
   end
 
-  if yes_lp && no_lp
-    yes_p = Math.exp(yes_lp)
-    no_p = Math.exp(no_lp)
-    yes_p / (yes_p + no_p)
-  elsif yes_lp
-    1.0
-  else
-    0.0
-  end
+  score = if yes_lp && no_lp
+             yes_p = Math.exp(yes_lp)
+             no_p = Math.exp(no_lp)
+             yes_p / (yes_p + no_p)
+           elsif yes_lp
+             1.0
+           else
+             0.0
+           end
+  spill_log(:debug, "rerank score=#{score.round(3)} for: #{document[0, 80]}")
+  score
 rescue Errno::ECONNREFUSED
   spill_log(:warn, 'ollama not running (connection refused), skipping rerank')
   raise
@@ -742,6 +757,7 @@ def cmd_retrieve
   prompt = prompt.strip
 
   keywords = extract_keywords(prompt)
+  spill_log(:debug, "retrieve: #{keywords.length} keywords: #{keywords.first(10).join(', ')}")
   exit 0 if keywords.empty?
 
   db = open_db
@@ -771,6 +787,8 @@ def cmd_retrieve
     vector_entries = query_vector(vec_db, prompt)
   end
 
+  spill_log(:debug, "retrieve: #{triples.length} triples, #{entries.length} fts, #{vector_entries.length} vector")
+
   all_entries = if entries.any? && vector_entries.any?
                   rrf_merge(entries, vector_entries)
                 elsif entries.any?
@@ -781,7 +799,9 @@ def cmd_retrieve
                   []
                 end
 
+  spill_log(:debug, "retrieve: #{all_entries.length} entries after RRF merge")
   all_entries = cross_encoder_rerank(prompt, all_entries) if all_entries.any?
+  spill_log(:debug, "retrieve: #{all_entries.length} entries after rerank")
 
   # Dispositional: surface preferences that pass the reranker for this query
   # Only inject when running all channels (no channel isolation)
@@ -844,6 +864,7 @@ end
 def cmd_maintain
   dry_run = ARGV.include?('--dry-run')
   full = ARGV.include?('--full')
+  spill_log(:debug, "maintain: dry_run=#{dry_run} full=#{full}")
 
   unless db_exists?
     puts JSON.generate({ contradictions_found: 0, corrections_linked: 0, stale_count: 0, supersessions_applied: 0, decayed_count: 0, dry_run: dry_run, min_decay_score: 1.0 })
@@ -982,6 +1003,7 @@ def cmd_maintain
       min_decay = decay if decay < min_decay
 
       if decay < DECAY_ARCHIVE_THRESHOLD
+        spill_log(:debug, "decay: archiving entry ##{entry['id']} (score=#{decay.round(4)}, type=#{entry['type']})")
         unless dry_run
           sql_exec(db, "UPDATE entries SET superseded_by = -1 WHERE id = ? AND superseded_by IS NULL", [entry['id']])
         end
@@ -1130,7 +1152,8 @@ def usage
                 --full adds contradiction detection and staleness tracking
 
     Environment:
-      CRIB_DB   Path to SQLite database (default: .state/crib/crib.db)
+      CRIB_DB        Path to SQLite database (default: .state/crib/crib.db)
+      CRIB_LOG_LEVEL Minimum log level: debug, info, warn, error (default: warn)
   USAGE
   exit 1
 end
