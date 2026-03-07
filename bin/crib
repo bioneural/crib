@@ -52,7 +52,7 @@
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
-#   retrieve  — <memory retrieved="...">...</memory> on stdout (empty = nothing relevant)
+#   retrieve  — <system-reminder>...</system-reminder> on stdout (empty = nothing relevant)
 #   init      — status on stderr
 #   maintain  — JSON on stdout: {"contradictions_found":N,"corrections_linked":N,"stale_count":N,"supersessions_applied":N,"decayed_count":N,"dry_run":bool,"min_decay_score":F}
 #
@@ -75,7 +75,7 @@
 #     3. Query three channels: triples (SQL), full-text (FTS5), vectors (sqlite-vec)
 #     4. Merge and deduplicate
 #     5. Rerank with ollama (cross-encoder logprob scoring)
-#     6. Wrap in <memory> tags and output to stdout
+#     6. Wrap in <system-reminder> tags and output to stdout
 #     7. Update last_retrieved_at on returned entries
 #     8. Exit 0 always (fail-open)
 #
@@ -814,14 +814,7 @@ def cmd_retrieve
 
   combined = truncate(combined, CHAR_BUDGET)
 
-  retrieved = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-  entry_count = triples.size + all_entries.size + pref_entries.size
-  preamble = "These are memories from previous sessions retrieved by relevance to " \
-    "the current context. Types: decision (a choice and why), correction (something " \
-    "previously wrong), error (a failure and what was learned), note (general " \
-    "knowledge), preference (an active behavioral directive). Timestamps are UTC. " \
-    "Newer entries supersede older ones on the same topic."
-  puts "<memory retrieved=\"#{retrieved}\" entries=\"#{entry_count}\">\n#{preamble}\n\n#{combined}\n</memory>"
+  puts "<system-reminder>\n#{combined}\n</system-reminder>"
 end
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1095,7 @@ def cmd_doctor
       Open3.capture2e(probe_env, 'ruby', __FILE__, 'write', stdin_data: 'type=note doctor probe test')
       output, = Open3.capture2(probe_env.merge('CRIB_CHANNEL' => 'fts'), 'ruby', __FILE__, 'retrieve',
         stdin_data: 'doctor probe test', err: File::NULL)
-      has_xml = output.include?('<memory retrieved=')
+      has_xml = output.include?('<system-reminder>')
       report['probe'] = { 'ok' => true }
       report['probe']['warn'] = 'retrieve output missing expected XML shape' unless has_xml
     rescue => e

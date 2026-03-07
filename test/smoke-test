@@ -201,11 +201,11 @@ else
   fail 'Retrieve empty', "expected exit 0, got #{empty_retrieve_status.exitstatus}"
 end
 
-# Retrieve wraps output in <memory> tags
-if fts_out.include?('<memory') && fts_out.include?('</memory>')
-  pass 'Retrieve wraps output in <memory> tags'
+# Retrieve wraps output in <system-reminder> tags
+if fts_out.include?('<system-reminder>') && fts_out.include?('</system-reminder>')
+  pass 'Retrieve wraps output in <system-reminder> tags'
 else
-  fail 'Retrieve tags', 'output missing <memory>...</memory> wrapper'
+  fail 'Retrieve tags', 'output missing <system-reminder>...</system-reminder> wrapper'
 end
 
 # Retrieve with missing DB exits 0 (fail-open)
