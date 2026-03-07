@@ -46,15 +46,13 @@
 #                 (per Cormack et al. 2009).
 #   CRIB_RERANK_THRESHOLD
 #                 Minimum rerank score for results. Entries at or below this
-#                 score are filtered out. Default: 0.0 (filters entries the
-#                 reranker scored as completely irrelevant — exact zeros).
-#                 Noise queries produce exact-zero scores for all candidates,
-#                 enabling empty results. Set higher (e.g. 0.5) for strict
-#                 relevance filtering, or -1 to disable.
+#                 score are filtered out. Default: 0.5 (the model must be
+#                 more confident "relevant" than "irrelevant"). Set to 0.0
+#                 to pass anything the model leans toward, or -1 to disable.
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
-#   retrieve  — <memory context_time="...">...</memory> on stdout (empty = nothing relevant)
+#   retrieve  — <memory retrieved="...">...</memory> on stdout (empty = nothing relevant)
 #   init      — status on stderr
 #   maintain  — JSON on stdout: {"contradictions_found":N,"corrections_linked":N,"stale_count":N,"supersessions_applied":N,"decayed_count":N,"dry_run":bool,"min_decay_score":F}
 #
@@ -113,7 +111,7 @@ SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', __dir__)
 DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, '.state', 'crib', 'crib.db') }
 EMBEDDING_MODEL = ENV.fetch('CRIB_EMBEDDING_MODEL', 'nomic-embed-text')
 EXTRACTION_MODEL = ENV.fetch('CRIB_EXTRACTION_MODEL', 'gemma3:1b')
-RERANK_MODEL = ENV.fetch('CRIB_RERANK_MODEL', 'gemma3:1b')
+RERANK_MODEL = ENV.fetch('CRIB_RERANK_MODEL', 'gemma3:4b')
 OLLAMA_HOST = ENV.fetch('OLLAMA_HOST', 'http://localhost:11434')
 EMBEDDING_DIM = 768 # nomic-embed-text output dimension
 DISTANCE_METRIC = ENV.fetch('CRIB_DISTANCE_METRIC', 'cosine')
@@ -121,7 +119,7 @@ VECTOR_DISTANCE_THRESHOLD = ENV.fetch('CRIB_VECTOR_THRESHOLD', '0.5').to_f
 RRF_K = ENV.fetch('CRIB_RRF_K', '60').to_i
 RRF_LIMIT = 20
 RERANK_LIMIT = 10
-RERANK_THRESHOLD = ENV.fetch('CRIB_RERANK_THRESHOLD', '0.0').to_f
+RERANK_THRESHOLD = ENV.fetch('CRIB_RERANK_THRESHOLD', '0.5').to_f
 FTS_CANDIDATES = 20
 VECTOR_CANDIDATES = 20
 
@@ -711,7 +709,7 @@ def rerank_score(prompt, document)
   end
 rescue Errno::ECONNREFUSED
   spill_log(:warn, 'ollama not running (connection refused), skipping rerank')
-  0.0
+  raise
 rescue => e
   spill_log(:error, "rerank_score failed: #{e.message}")
   0.0
@@ -785,7 +783,7 @@ def cmd_retrieve
 
   all_entries = cross_encoder_rerank(prompt, all_entries) if all_entries.any?
 
-  # Dispositional: always surface active preferences regardless of query
+  # Dispositional: surface preferences that pass the reranker for this query
   # Only inject when running all channels (no channel isolation)
   pref_entries = []
   unless channel
@@ -797,6 +795,7 @@ def cmd_retrieve
       [pref_limit])
     existing_ids = all_entries.map { |e| e['id'] }
     pref_entries.reject! { |p| existing_ids.include?(p['id']) }
+    pref_entries = cross_encoder_rerank(prompt, pref_entries) if pref_entries.any?
   end
 
   # Track access times on returned entries + preference entries
@@ -1103,7 +1102,7 @@ def cmd_doctor
       Open3.capture2e(probe_env, 'ruby', __FILE__, 'write', stdin_data: 'type=note doctor probe test')
       output, = Open3.capture2(probe_env.merge('CRIB_CHANNEL' => 'fts'), 'ruby', __FILE__, 'retrieve',
         stdin_data: 'doctor probe test', err: File::NULL)
-      has_xml = output.include?('<memory context_time=')
+      has_xml = output.include?('<memory retrieved=')
       report['probe'] = { 'ok' => true }
       report['probe']['warn'] = 'retrieve output missing expected XML shape' unless has_xml
     rescue => e
