@@ -37,7 +37,7 @@ at_exit { FileUtils.rm_rf(tmpdir) }
 
 # Base environment for subprocess calls — points at the temporary database
 # and preserves OLLAMA_HOST / PATH for shim interception.
-env = { 'CRIB_DB' => test_db }
+env = { 'CRIB_DB' => test_db, 'CRIB_LOG_LEVEL' => 'info' }
 
 # ---------------------------------------------------------------------------
 # Structure
