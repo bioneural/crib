@@ -145,6 +145,7 @@ HALF_LIFE = {
   'note'        => ENV.fetch('CRIB_HALF_LIFE_NOTE',       '14').to_i,
   'interest'    => ENV.fetch('CRIB_HALF_LIFE_INTEREST',    '7').to_i,
   'preference'  => ENV.fetch('CRIB_HALF_LIFE_PREFERENCE','120').to_i,
+  'reflection'  => ENV.fetch('CRIB_HALF_LIFE_REFLECTION','180').to_i,
 }.freeze
 
 DECAY_ARCHIVE_THRESHOLD = ENV.fetch('CRIB_DECAY_THRESHOLD', '0.05').to_f

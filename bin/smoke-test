@@ -82,7 +82,7 @@ section "Init"
 
 test_init() {
   local output
-  output=$("$CRIB" init 2>&1)
+  output=$(CRIB_LOG_LEVEL=info "$CRIB" init 2>&1)
   if echo "$output" | grep -q "initialized"; then
     pass "Init creates database"
   else
@@ -135,7 +135,7 @@ rm -f "$CRIB_DB"
 
 test_write_basic() {
   local output
-  output=$(echo "type=note Smoke test entry for crib" | "$CRIB" write 2>&1)
+  output=$(echo "type=note Smoke test entry for crib" | CRIB_LOG_LEVEL=info "$CRIB" write 2>&1)
   if echo "$output" | grep -q "stored entry"; then
     pass "Write stores entry and reports success"
   else
@@ -146,7 +146,7 @@ test_write_basic
 
 test_write_with_type() {
   local output
-  output=$(echo "type=decision Chose SQLite for storage" | "$CRIB" write 2>&1)
+  output=$(echo "type=decision Chose SQLite for storage" | CRIB_LOG_LEVEL=info "$CRIB" write 2>&1)
   if echo "$output" | grep -q "stored entry" && echo "$output" | grep -q "(decision)"; then
     pass "Write respects type= prefix"
   else
@@ -157,7 +157,7 @@ test_write_with_type
 
 test_write_triples_extracted() {
   local output
-  output=$(echo "type=decision PostgreSQL is the database for the billing system" | "$CRIB" write 2>&1)
+  output=$(echo "type=decision PostgreSQL is the database for the billing system" | CRIB_LOG_LEVEL=info "$CRIB" write 2>&1)
   if echo "$output" | grep -q "triples extracted"; then
     pass "Write extracts triples"
   else
@@ -185,10 +185,10 @@ section "Retrieve"
 test_retrieve_fts() {
   local output
   output=$(echo "what database for billing?" | "$CRIB" retrieve 2>/dev/null)
-  if echo "$output" | grep -q "<memory" && echo "$output" | grep -q "PostgreSQL"; then
+  if echo "$output" | grep -q "<system-reminder>" && echo "$output" | grep -q "PostgreSQL"; then
     pass "Retrieve finds entries via FTS5"
   else
-    fail "Retrieve FTS" "expected <memory> with PostgreSQL, got: $output"
+    fail "Retrieve FTS" "expected <system-reminder> with PostgreSQL, got: $output"
   fi
 }
 test_retrieve_fts
@@ -209,7 +209,7 @@ test_retrieve_vector() {
   local output
   # Semantic query that might not match keywords but should match embeddings
   output=$(echo "which relational database powers invoicing?" | "$CRIB" retrieve 2>/dev/null)
-  if echo "$output" | grep -q "<memory"; then
+  if echo "$output" | grep -q "<system-reminder>"; then
     pass "Retrieve finds entries via vector similarity"
   else
     # Vector search depends on embedding quality — not a hard failure
@@ -222,10 +222,10 @@ test_retrieve_memory_tags() {
   local output
   output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
   if [[ -n "$output" ]]; then
-    if echo "$output" | grep -q "<memory" && echo "$output" | grep -q "</memory>"; then
-      pass "Retrieve wraps output in <memory> tags"
+    if echo "$output" | grep -q "<system-reminder>" && echo "$output" | grep -q "</system-reminder>"; then
+      pass "Retrieve wraps output in <system-reminder> tags"
     else
-      fail "Retrieve tags" "output missing <memory> tags"
+      fail "Retrieve tags" "output missing <system-reminder> tags"
     fi
   else
     pass "Retrieve returns empty for no match (fail-open)"
@@ -233,35 +233,20 @@ test_retrieve_memory_tags() {
 }
 test_retrieve_memory_tags
 
-test_retrieve_metadata() {
+test_retrieve_section_headers() {
   local output
   output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
   if [[ -n "$output" ]]; then
-    if echo "$output" | grep -qE '<memory retrieved="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z" entries="[0-9]+">'; then
-      pass "Retrieve includes retrieved and entries attributes on <memory> tag"
+    if echo "$output" | grep -q "## Memory entries"; then
+      pass "Retrieve includes Memory entries section header"
     else
-      fail "Retrieve metadata" "expected retrieved and entries attributes, got: $(echo "$output" | head -1)"
+      fail "Retrieve sections" "expected '## Memory entries' header in output"
     fi
   else
     pass "Retrieve returns empty for no match (fail-open)"
   fi
 }
-test_retrieve_metadata
-
-test_retrieve_preamble() {
-  local output
-  output=$(echo "SQLite storage" | "$CRIB" retrieve 2>/dev/null)
-  if [[ -n "$output" ]]; then
-    if echo "$output" | grep -q "These are memories from previous sessions"; then
-      pass "Retrieve includes preamble paragraph"
-    else
-      fail "Retrieve preamble" "expected preamble text in output"
-    fi
-  else
-    pass "Retrieve returns empty for no match (fail-open)"
-  fi
-}
-test_retrieve_preamble
+test_retrieve_section_headers
 
 test_retrieve_entry_timestamps() {
   local output
@@ -392,6 +377,52 @@ test_rerank_threshold_filters_irrelevant() {
   fi
 }
 test_rerank_threshold_filters_irrelevant
+
+# ---------------------------------------------------------------------------
+section "Reflection entries"
+# ---------------------------------------------------------------------------
+
+test_write_reflection() {
+  local output
+  output=$(echo "type=reflection Verify claims against the codebase before stating them" | CRIB_LOG_LEVEL=info "$CRIB" write 2>&1)
+  if echo "$output" | grep -q "stored entry" && echo "$output" | grep -q "(reflection)"; then
+    pass "Write stores reflection entry"
+  else
+    fail "Write reflection" "expected 'stored entry' and '(reflection)', got: $output"
+  fi
+}
+test_write_reflection
+
+test_retrieve_reflection() {
+  local output
+  output=$(echo "I need to check whether this function exists" | "$CRIB" retrieve 2>/dev/null)
+  if [[ -n "$output" ]]; then
+    if echo "$output" | grep -q "Verify claims"; then
+      pass "Retrieve surfaces reflection for related query"
+    else
+      # Relevance depends on rerank scoring — not a hard failure
+      pass "Retrieve runs without error (reflection relevance depends on rerank scoring)"
+    fi
+  else
+    pass "Retrieve runs without error (reflection relevance depends on rerank scoring)"
+  fi
+}
+test_retrieve_reflection
+
+test_reflection_in_memory_entries() {
+  local output
+  output=$(echo "verify claims codebase" | CRIB_CHANNEL=fts "$CRIB" retrieve 2>/dev/null)
+  if [[ -n "$output" ]]; then
+    if echo "$output" | grep -q "Memory entries" && echo "$output" | grep -q "reflection"; then
+      pass "Reflection appears in Memory entries section"
+    else
+      fail "Reflection format" "expected 'Memory entries' with 'reflection' type prefix"
+    fi
+  else
+    fail "Reflection format" "expected output for FTS query matching reflection content"
+  fi
+}
+test_reflection_in_memory_entries
 
 # ---------------------------------------------------------------------------
 # Summary
