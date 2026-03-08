@@ -65,7 +65,7 @@
 # Behavior:
 #   write:
 #     1. Read text from stdin
-#     2. Parse optional type= prefix (decision, correction, note, error)
+#     2. Parse optional type= prefix (fact, lesson, directive)
 #     3. Initialize database if needed
 #     4. Store entry with FTS5 indexing
 #     5. Extract fact triples via ollama
@@ -137,15 +137,15 @@ CHAR_BUDGET = TOKEN_BUDGET * 4
 
 STALENESS_DAYS = 30
 
+KNOWLEDGE_DIR = ENV.fetch('CRIB_KNOWLEDGE_DIR') {
+  File.join(File.dirname(DB_PATH), 'knowledge')
+}
+
 # Base half-lives by entry type (days)
 HALF_LIFE = {
-  'decision'    => ENV.fetch('CRIB_HALF_LIFE_DECISION',   '90').to_i,
-  'correction'  => ENV.fetch('CRIB_HALF_LIFE_CORRECTION', '60').to_i,
-  'error'       => ENV.fetch('CRIB_HALF_LIFE_ERROR',      '30').to_i,
-  'note'        => ENV.fetch('CRIB_HALF_LIFE_NOTE',       '14').to_i,
-  'interest'    => ENV.fetch('CRIB_HALF_LIFE_INTEREST',    '7').to_i,
-  'preference'  => ENV.fetch('CRIB_HALF_LIFE_PREFERENCE','120').to_i,
-  'reflection'  => ENV.fetch('CRIB_HALF_LIFE_REFLECTION','180').to_i,
+  'fact'      => ENV.fetch('CRIB_HALF_LIFE_FACT',      '30').to_i,
+  'lesson'    => ENV.fetch('CRIB_HALF_LIFE_LESSON',    '30').to_i,
+  'directive' => ENV.fetch('CRIB_HALF_LIFE_DIRECTIVE', '180').to_i,
 }.freeze
 
 DECAY_ARCHIVE_THRESHOLD = ENV.fetch('CRIB_DECAY_THRESHOLD', '0.05').to_f
@@ -188,7 +188,8 @@ SCHEMA = <<~SQL
     type TEXT NOT NULL,
     content TEXT NOT NULL,
     embedding BLOB,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (datetime('now')),
+    source TEXT NOT NULL DEFAULT 'agent'
   );
 
   CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
@@ -336,6 +337,9 @@ def run_migrations(db)
   unless has_column?(db, 'entries', 'retrieval_count')
     db.execute("ALTER TABLE entries ADD COLUMN retrieval_count INTEGER DEFAULT 0")
   end
+  unless has_column?(db, 'entries', 'source')
+    db.execute("ALTER TABLE entries ADD COLUMN source TEXT NOT NULL DEFAULT 'agent'")
+  end
 rescue SQLite3::Exception => e
   spill_log(:error, "migration error: #{e.message}")
 end
@@ -384,10 +388,10 @@ end
 # Write
 # ---------------------------------------------------------------------------
 
-def store_entry(db, type, content)
+def store_entry(db, type, content, source = 'agent')
   sql_insert_returning_id(db,
-    "INSERT INTO entries(type, content) VALUES (?, ?);",
-    [type, content])
+    "INSERT INTO entries(type, content, source) VALUES (?, ?, ?);",
+    [type, content, source])
 end
 
 def extract_triples(text)
@@ -475,38 +479,36 @@ def cmd_write
   text = text.strip
 
   # Parse optional type prefix
-  type = 'note'
+  type = 'fact'
   if text.match?(/\Atype=\w+\s/)
     type = text[/\Atype=(\w+)/, 1]
     text = text.sub(/\Atype=\w+\s+/, '')
   end
+
+  source = 'agent'
+  if text.match?(/\Asource=\w+\s/)
+    source = text[/\Asource=(\w+)/, 1]
+    text = text.sub(/\Asource=\w+\s+/, '')
+  end
+
   spill_log(:debug, "write: type=#{type}, #{text.length} chars")
 
   init_db
 
   db = open_db
 
-  # Write-time dedup: check for substantially similar content written in the last hour
-  existing = db.get_first_value(
-    "SELECT COUNT(*) FROM entries_fts WHERE entries_fts MATCH ? AND rowid IN " \
-    "(SELECT id FROM entries WHERE created_at > datetime('now', '-1 hour'))",
-    [text.split(/\s+/).first(10).join(' ')]
+  # Write-time dedup: exact content match (any time)
+  exact_dup = db.get_first_value(
+    "SELECT COUNT(*) FROM entries WHERE content = ? AND superseded_by IS NULL",
+    [text]
   ).to_i
-
-  if existing > 0
-    # Check for exact or near-exact match
-    recent = db.execute(
-      "SELECT content FROM entries WHERE created_at > datetime('now', '-1 hour') ORDER BY id DESC LIMIT 20"
-    )
-    duplicate = recent.any? { |r| r['content'] == text }
-    if duplicate
-      spill_log(:info, "write-time dedup: skipping duplicate content")
-      db.close
-      return
-    end
+  if exact_dup > 0
+    spill_log(:info, "write-time dedup: skipping exact duplicate content")
+    db.close
+    return
   end
 
-  entry_id = store_entry(db, type, text)
+  entry_id = store_entry(db, type, text, source)
   if entry_id.nil?
     spill_log(:error, 'failed to store entry')
     db.close
@@ -585,7 +587,7 @@ def query_fts(db, keywords)
   fts_query = keywords.join(' OR ')
 
   sql_query(db, <<~SQL, [fts_query])
-    SELECT e.id, e.type, e.content, e.created_at
+    SELECT e.id, e.type, e.content, e.created_at, e.source
     FROM entries e
     JOIN entries_fts f ON e.id = f.rowid
     WHERE entries_fts MATCH ?
@@ -621,7 +623,7 @@ def query_vector(vec_db, prompt)
   ids = vec_results.map { |r| r['rowid'] }
   placeholders = ids.map { '?' }.join(',')
   entries = sql_query(vec_db,
-    "SELECT id, type, content, created_at FROM entries WHERE id IN (#{placeholders}) AND superseded_by IS NULL;",
+    "SELECT id, type, content, created_at, source FROM entries WHERE id IN (#{placeholders}) AND superseded_by IS NULL;",
     ids)
 
   entries.each { |e| e['distance'] = dist_by_id[e['id']] }
@@ -671,16 +673,16 @@ def format_entries(entries)
   return '' if entries.empty?
   lines = entries.map do |e|
     date = format_datetime(e['created_at'])
-    prefix = date ? "#{date} #{e['type']}" : e['type']
+    prefix = date ? "#{date} #{e['type']} #{e['source'] || 'agent'}" : "#{e['type']} #{e['source'] || 'agent'}"
     "- [#{prefix}] #{e['content']}"
   end
   "## Memory entries\n\n#{lines.join("\n")}"
 end
 
-def format_preferences(entries)
+def format_directives(entries)
   return '' if entries.empty?
   lines = entries.map { |e| "- #{e['content']}" }
-  "## Active preferences\n\n#{lines.join("\n")}"
+  "## Active directives\n\n#{lines.join("\n")}"
 end
 
 def cross_encoder_rerank(prompt, entries)
@@ -832,8 +834,8 @@ def cmd_retrieve
   unless channel
     pref_limit = ENV.fetch('CRIB_PREF_LIMIT', '5').to_i
     pref_entries = sql_query(db,
-      "SELECT id, type, content, created_at FROM entries " \
-      "WHERE type = 'preference' AND superseded_by IS NULL " \
+      "SELECT id, type, content, created_at, source FROM entries " \
+      "WHERE type = 'directive' AND superseded_by IS NULL " \
       "ORDER BY created_at DESC LIMIT ?;",
       [pref_limit])
     existing_ids = all_entries.map { |e| e['id'] }
@@ -850,7 +852,7 @@ def cmd_retrieve
 
   triples_text = format_triples(triples)
   entries_text = format_entries(all_entries)
-  prefs_text = format_preferences(pref_entries)
+  prefs_text = format_directives(pref_entries)
 
   combined = [triples_text, entries_text, prefs_text].reject(&:empty?).join("\n\n")
   exit 0 if combined.empty?
@@ -950,7 +952,7 @@ def cmd_maintain
   # the original entry being corrected via vector search.
   begin
     corrections = sql_query(db,
-      "SELECT id, content FROM entries WHERE type = 'correction' AND superseded_by IS NULL;")
+      "SELECT id, content FROM entries WHERE type = 'lesson' AND superseded_by IS NULL;")
 
     vec_db = open_db_vec
 
@@ -1020,7 +1022,7 @@ def cmd_maintain
     active_entries.each do |entry|
       last_access = entry['last_retrieved_at'] || entry['created_at']
       elapsed = (Time.now.utc - Time.parse(last_access)).to_f / 86400.0
-      base_hl = HALF_LIFE.fetch(entry['type'], HALF_LIFE['note'])
+      base_hl = HALF_LIFE.fetch(entry['type'], HALF_LIFE['fact'])
       eff_hl = base_hl * (1.0 + RETRIEVAL_BOOST * Math.log(1.0 + entry['rc']))
       decay = Math.exp(-elapsed * Math.log(2) / eff_hl)
       min_decay = decay if decay < min_decay
@@ -1159,6 +1161,239 @@ def cmd_doctor
 end
 
 # ---------------------------------------------------------------------------
+# Migrate
+# ---------------------------------------------------------------------------
+
+def cmd_migrate
+  unless db_exists?
+    spill_log(:info, "no database to migrate")
+    exit 0
+  end
+
+  db = open_db
+  run_migrations(db)
+
+  type_map = {
+    'note'       => 'fact',
+    'decision'   => 'fact',
+    'preference' => 'directive',
+    'interest'   => 'fact',
+    'correction' => 'lesson',
+    'error'      => 'lesson',
+    'reasoning'  => 'lesson',
+    'reflection' => 'lesson',
+  }
+
+  type_map.each do |old_type, new_type|
+    sql_exec(db, "UPDATE entries SET type = ? WHERE type = ?", [new_type, old_type])
+    count = db.changes rescue 0
+    spill_log(:info, "migrate: #{old_type} → #{new_type}: #{count} entries")
+  end
+
+  # Set source='agent' on any entries that have NULL or empty source
+  sql_exec(db, "UPDATE entries SET source = 'agent' WHERE source IS NULL OR source = ''")
+
+  db.close
+  spill_log(:info, "migration complete")
+end
+
+# ---------------------------------------------------------------------------
+# Sync
+# ---------------------------------------------------------------------------
+
+def kebab_case(text, max_len = 50)
+  text.downcase
+      .gsub(/[^a-z0-9\s-]/, '')
+      .strip
+      .gsub(/\s+/, '-')
+      .slice(0, max_len)
+      .sub(/-+\z/, '')
+end
+
+def find_related(db, entry_id, keywords, limit = 5)
+  return [] if keywords.empty?
+  fts_query = keywords.first(5).join(' OR ')
+  results = sql_query(db, <<~SQL, [fts_query, entry_id, limit])
+    SELECT e.id, e.type, e.content
+    FROM entries e
+    JOIN entries_fts f ON e.id = f.rowid
+    WHERE entries_fts MATCH ?
+      AND e.id != ?
+      AND e.superseded_by IS NULL
+    ORDER BY e.created_at DESC
+    LIMIT ?;
+  SQL
+  results.map { |r| kebab_case(r['content']) + '.md' }
+end
+
+def cmd_sync
+  unless db_exists?
+    spill_log(:info, "no database to sync")
+    exit 0
+  end
+
+  db = open_db
+  run_migrations(db)
+
+  entries = sql_query(db, <<~SQL)
+    SELECT id, type, content, created_at, last_retrieved_at, source,
+           COALESCE(retrieval_count, 0) as retrieval_count
+    FROM entries
+    WHERE superseded_by IS NULL
+    ORDER BY created_at DESC;
+  SQL
+
+  staleness_threshold = Time.now.utc - (STALENESS_DAYS * 86400)
+
+  tag_counts = Hash.new(0)
+  entries.each { |e| tag_counts[e['type']] += 1 }
+
+  tmp_dir = "#{KNOWLEDGE_DIR}.tmp.#{$$}"
+  FileUtils.rm_rf(tmp_dir)
+  FileUtils.mkdir_p(tmp_dir)
+
+  index_lines = []
+  index_lines << "# Knowledge Index"
+  index_lines << ""
+  index_lines << "_Generated: #{Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')}_"
+  index_lines << ""
+
+  stale_entries = entries.select do |e|
+    last = e['last_retrieved_at'] || e['created_at']
+    last && Time.parse(last) < staleness_threshold
+  end
+  unless stale_entries.empty?
+    index_lines << "## Staleness warnings"
+    index_lines << ""
+    stale_entries.first(10).each do |e|
+      index_lines << "- **#{kebab_case(e['content'])}** — not accessed in #{STALENESS_DAYS}+ days"
+    end
+    index_lines << "- _(#{stale_entries.length - 10} more)_" if stale_entries.length > 10
+    index_lines << ""
+  end
+
+  all_types = %w[fact lesson directive]
+  low_types = all_types.select { |t| tag_counts[t].to_i < 3 }
+  unless low_types.empty?
+    index_lines << "## Coverage gaps"
+    index_lines << ""
+    low_types.each { |t| index_lines << "- `#{t}` has only #{tag_counts[t].to_i} entries" }
+    index_lines << ""
+  end
+
+  operator_entries = entries.select { |e| e['source'] == 'operator' }
+  agent_entries = entries.select { |e| e['source'] == 'agent' }
+  conflicts = []
+  operator_entries.each do |op|
+    op_kw = extract_keywords(op['content']).first(3)
+    next if op_kw.empty?
+    agent_entries.each do |ag|
+      ag_kw = extract_keywords(ag['content']).first(3)
+      if (op_kw & ag_kw).length >= 2
+        conflicts << { operator: op, agent: ag }
+      end
+    end
+  end
+  unless conflicts.empty?
+    index_lines << "## Potential conflicts (operator vs agent)"
+    index_lines << ""
+    conflicts.first(5).each do |c|
+      index_lines << "- operator: #{c[:operator]['content'][0,60]}..."
+      index_lines << "  agent: #{c[:agent]['content'][0,60]}..."
+    end
+    index_lines << ""
+  end
+
+  index_lines << "## Entries"
+  index_lines << ""
+  index_lines << "| File | Type | Source | Created |"
+  index_lines << "|------|------|--------|---------|"
+
+  entries.each do |entry|
+    filename = "#{kebab_case(entry['content'])}.md"
+    base = filename
+    counter = 1
+    while File.exist?(File.join(tmp_dir, filename))
+      filename = base.sub('.md', "-#{counter}.md")
+      counter += 1
+    end
+
+    keywords = extract_keywords(entry['content'])
+    related = find_related(db, entry['id'], keywords)
+    created = format_datetime(entry['created_at']) || 'unknown'
+    updated = format_datetime(entry['last_retrieved_at'] || entry['created_at']) || created
+
+    frontmatter = []
+    frontmatter << "---"
+    frontmatter << "type: #{entry['type']}"
+    frontmatter << "source: #{entry['source'] || 'agent'}"
+    frontmatter << "created: #{created}"
+    frontmatter << "updated: #{updated}"
+    frontmatter << "retrieval_count: #{entry['retrieval_count']}"
+    frontmatter << "related: [#{related.first(5).map { |r| "\"#{r}\"" }.join(', ')}]" unless related.empty?
+    frontmatter << "---"
+
+    body = "#{frontmatter.join("\n")}\n\n#{entry['content']}\n"
+    File.write(File.join(tmp_dir, filename), body)
+
+    source = entry['source'] || 'agent'
+    index_lines << "| #{filename} | #{entry['type']} | #{source} | #{created} |"
+  end
+
+  File.write(File.join(tmp_dir, '_index.md'), index_lines.join("\n") + "\n")
+
+  FileUtils.rm_rf(KNOWLEDGE_DIR)
+  FileUtils.mv(tmp_dir, KNOWLEDGE_DIR)
+
+  db.close
+  spill_log(:info, "synced #{entries.length} entries to #{KNOWLEDGE_DIR}")
+end
+
+# ---------------------------------------------------------------------------
+# Correct
+# ---------------------------------------------------------------------------
+
+def cmd_correct
+  text = $stdin.read
+  if text.nil? || text.strip.empty?
+    spill_log(:error, 'empty input')
+    exit 1
+  end
+  text = text.strip
+
+  type = 'fact'
+  if text.match?(/\Atype=\w+\s/)
+    type = text[/\Atype=(\w+)/, 1]
+    text = text.sub(/\Atype=\w+\s+/, '')
+  end
+
+  init_db
+
+  db = open_db
+  entry_id = store_entry(db, type, text, 'operator')
+  if entry_id.nil?
+    spill_log(:error, 'failed to store correction')
+    db.close
+    exit 1
+  end
+
+  triples = extract_triples(text)
+  triples.each do |triple|
+    store_triple(db, triple['subject'] || 'unknown', triple['subject_type'] || 'concept',
+      triple['predicate'] || 'related_to', triple['object'] || 'unknown',
+      triple['object_type'] || 'concept', text)
+  end
+  db.close
+
+  embedding = generate_embedding(text)
+  vec_db = open_db_vec
+  store_embedding(vec_db, entry_id, embedding)
+  vec_db&.close
+
+  spill_log(:info, "stored operator entry ##{entry_id} (#{type})")
+end
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1173,6 +1408,9 @@ def usage
       doctor    Check prerequisites and report status (JSON)
       maintain  Run maintenance: correction linking + decay (JSON)
                 --full adds contradiction detection and staleness tracking
+      migrate   Remap old entry types to fact/lesson/directive
+      sync      Export entries to knowledge directory as Markdown files
+      correct   Store an operator correction (stdin, sets source=operator)
 
     Environment:
       CRIB_DB        Path to SQLite database (default: .state/crib/crib.db)
@@ -1188,5 +1426,8 @@ when 'retrieve' then cmd_retrieve
 when 'init'     then cmd_init
 when 'doctor'   then cmd_doctor
 when 'maintain' then cmd_maintain
+when 'migrate'  then cmd_migrate
+when 'sync'     then cmd_sync
+when 'correct'  then cmd_correct
 else usage
 end

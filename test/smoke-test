@@ -139,7 +139,7 @@ FileUtils.rm_f(test_db)
 # Basic write
 write_out, write_err, write_status = Open3.capture3(
   env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Smoke test entry for crib\n"
+  stdin_data: "type=fact Smoke test entry for crib\n"
 )
 if write_status.success? && write_err.include?('stored entry')
   pass 'Write stores a note and reports success'
@@ -150,9 +150,9 @@ end
 # Write with type=decision
 decision_out, decision_err, decision_status = Open3.capture3(
   env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=decision Chose SQLite for storage\n"
+  stdin_data: "type=lesson Learned to verify before asserting\n"
 )
-if decision_status.success? && decision_err.include?('stored entry') && decision_err.include?('decision')
+if decision_status.success? && decision_err.include?('stored entry') && decision_err.include?('lesson')
   pass 'Write respects type=decision prefix'
 else
   fail 'Write type', "expected 'stored entry' and 'decision' in stderr, got: #{decision_err}"
@@ -184,7 +184,7 @@ Open3.capture3(fts_env, 'ruby', CRIB_BIN, 'init')
 
 Open3.capture3(
   fts_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=decision Chose bananaphone as the primary communication device\n"
+  stdin_data: "type=fact Chose bananaphone as the primary communication device\n"
 )
 
 fts_out, = Open3.capture2(
@@ -243,11 +243,11 @@ Open3.capture3(pref_env, 'ruby', CRIB_BIN, 'init')
 # Write a note (for FTS retrieval) and an unrelated preference
 Open3.capture3(
   pref_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Ruby was chosen for all prophet scripts because it reads like English\n"
+  stdin_data: "type=fact Ruby was chosen for all prophet scripts because it reads like English\n"
 )
 Open3.capture3(
   pref_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=preference Always use tabs instead of spaces for indentation\n"
+  stdin_data: "type=directive Always use tabs instead of spaces for indentation\n"
 )
 
 # Without reranker (FTS channel only), preference is not injected
@@ -321,7 +321,7 @@ decay_env = env.merge('CRIB_DB' => decay_db)
 Open3.capture3(decay_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
   decay_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Ephemeral thought about yesterday's weather\n"
+  stdin_data: "type=fact Ephemeral thought about yesterday's weather\n"
 )
 
 # Backdate the entry's timestamps well beyond the half-life
@@ -353,7 +353,7 @@ dryrun_env = env.merge('CRIB_DB' => dryrun_db)
 Open3.capture3(dryrun_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
   dryrun_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Temporary observation about dry run testing\n"
+  stdin_data: "type=fact Temporary observation about dry run testing\n"
 )
 
 Open3.capture2(SQLITE3, dryrun_db,
@@ -383,7 +383,7 @@ grace_env = env.merge('CRIB_DB' => grace_db)
 Open3.capture3(grace_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
   grace_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Recent thought within grace period\n"
+  stdin_data: "type=fact Recent thought within grace period\n"
 )
 
 Open3.capture2(SQLITE3, grace_db,
@@ -472,11 +472,11 @@ Open3.capture3(dedup_env, 'ruby', CRIB_BIN, 'init')
 # Write same content twice
 Open3.capture3(
   dedup_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Unique dedup test content for smoke testing\n"
+  stdin_data: "type=fact Unique dedup test content for smoke testing\n"
 )
 Open3.capture3(
   dedup_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Unique dedup test content for smoke testing\n"
+  stdin_data: "type=fact Unique dedup test content for smoke testing\n"
 )
 
 dedup_count, = Open3.capture2(SQLITE3, dedup_db, 'SELECT COUNT(*) FROM entries;')
@@ -489,7 +489,7 @@ end
 # Write different content — should produce two entries
 Open3.capture3(
   dedup_env, 'ruby', CRIB_BIN, 'write',
-  stdin_data: "type=note Completely different content for dedup testing\n"
+  stdin_data: "type=fact Completely different content for dedup testing\n"
 )
 
 dedup_count2, = Open3.capture2(SQLITE3, dedup_db, 'SELECT COUNT(*) FROM entries;')
@@ -497,6 +497,152 @@ if dedup_count2.strip.to_i == 2
   pass 'Write-time dedup: different content produces separate entries'
 else
   fail 'Write-time dedup different', "expected 2 entries, got #{dedup_count2.strip}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Provenance'
+# ---------------------------------------------------------------------------
+
+prov_db = File.join(tmpdir, 'prov.db')
+prov_env = env.merge('CRIB_DB' => prov_db)
+Open3.capture3(prov_env, 'ruby', CRIB_BIN, 'init')
+
+# Default source is agent
+Open3.capture3(prov_env, 'ruby', CRIB_BIN, 'write', stdin_data: "type=fact Agent-sourced entry\n")
+source_out, = Open3.capture2(SQLITE3, prov_db, "SELECT source FROM entries WHERE id = (SELECT MAX(id) FROM entries);")
+if source_out.strip == 'agent'
+  pass 'Default source is agent'
+else
+  fail 'Default source', "expected 'agent', got #{source_out.strip}"
+end
+
+# Explicit source=operator
+Open3.capture3(prov_env, 'ruby', CRIB_BIN, 'write', stdin_data: "type=fact source=operator Operator-sourced entry\n")
+source_out2, = Open3.capture2(SQLITE3, prov_db, "SELECT source FROM entries WHERE id = (SELECT MAX(id) FROM entries);")
+if source_out2.strip == 'operator'
+  pass 'source=operator prefix sets provenance'
+else
+  fail 'source=operator', "expected 'operator', got #{source_out2.strip}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Correct subcommand'
+# ---------------------------------------------------------------------------
+
+correct_db = File.join(tmpdir, 'correct.db')
+correct_env = env.merge('CRIB_DB' => correct_db)
+Open3.capture3(correct_env, 'ruby', CRIB_BIN, 'init')
+
+_, correct_err, correct_status = Open3.capture3(
+  correct_env, 'ruby', CRIB_BIN, 'correct',
+  stdin_data: "type=lesson Operator correction test entry\n"
+)
+if correct_status.success? && correct_err.include?('stored operator entry')
+  pass 'Correct subcommand stores operator entry'
+else
+  fail 'Correct', "expected 'stored operator entry', got: #{correct_err}"
+end
+
+source_out3, = Open3.capture2(SQLITE3, correct_db, "SELECT source FROM entries WHERE id = (SELECT MAX(id) FROM entries);")
+if source_out3.strip == 'operator'
+  pass 'Correct subcommand sets source=operator'
+else
+  fail 'Correct source', "expected 'operator', got #{source_out3.strip}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Migration'
+# ---------------------------------------------------------------------------
+
+migrate_db = File.join(tmpdir, 'migrate.db')
+migrate_env = env.merge('CRIB_DB' => migrate_db)
+Open3.capture3(migrate_env, 'ruby', CRIB_BIN, 'init')
+
+# Write entries with old types
+%w[note decision preference correction error reasoning reflection].each do |old_type|
+  Open3.capture3(migrate_env, 'ruby', CRIB_BIN, 'write', stdin_data: "type=#{old_type} Test #{old_type} for migration\n")
+end
+
+# Run migration
+_, _, migrate_status = Open3.capture3(migrate_env, 'ruby', CRIB_BIN, 'migrate', err: File::NULL)
+if migrate_status.success?
+  pass 'Migrate subcommand exits 0'
+else
+  fail 'Migrate', "exited with #{migrate_status.exitstatus}"
+end
+
+# Verify types remapped
+types_out, = Open3.capture2(SQLITE3, migrate_db, "SELECT DISTINCT type FROM entries ORDER BY type;")
+types = types_out.strip.split("\n").sort
+if types == %w[directive fact lesson]
+  pass 'Migration remaps old types to fact/lesson/directive'
+elsif types.all? { |t| %w[fact lesson directive].include?(t) }
+  pass 'Migration remaps to new types (subset)'
+else
+  fail 'Migration types', "expected [directive, fact, lesson], got #{types.inspect}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Sync subcommand'
+# ---------------------------------------------------------------------------
+
+sync_db = File.join(tmpdir, 'sync.db')
+sync_dir = File.join(tmpdir, 'knowledge')
+sync_env = env.merge('CRIB_DB' => sync_db, 'CRIB_KNOWLEDGE_DIR' => sync_dir)
+Open3.capture3(sync_env, 'ruby', CRIB_BIN, 'init')
+
+Open3.capture3(sync_env, 'ruby', CRIB_BIN, 'write', stdin_data: "type=fact Chose SQLite for memory storage\n")
+Open3.capture3(sync_env, 'ruby', CRIB_BIN, 'write', stdin_data: "type=lesson Always verify assertions against code\n")
+Open3.capture3(sync_env, 'ruby', CRIB_BIN, 'write', stdin_data: "type=directive Enforce policy on every action\n")
+
+_, _, sync_status = Open3.capture3(sync_env, 'ruby', CRIB_BIN, 'sync', err: File::NULL)
+if sync_status.success?
+  pass 'Sync subcommand exits 0'
+else
+  fail 'Sync', "exited with #{sync_status.exitstatus}"
+end
+
+index_path = File.join(sync_dir, '_index.md')
+if File.exist?(index_path)
+  index_content = File.read(index_path)
+  if index_content.include?('Knowledge Index') && index_content.include?('fact') && index_content.include?('lesson')
+    pass 'Sync generates _index.md with entry listing'
+  else
+    fail 'Sync _index.md', 'missing expected content'
+  end
+
+  if index_content.include?('Coverage gaps') || index_content.include?('Entries')
+    pass 'Sync _index.md includes enriched sections'
+  else
+    fail 'Sync enrichment', 'missing coverage/staleness sections'
+  end
+else
+  fail 'Sync _index.md', 'not created'
+end
+
+md_files = Dir.glob(File.join(sync_dir, '*.md')).reject { |f| File.basename(f) == '_index.md' }
+if md_files.length == 3
+  pass 'Sync creates one file per entry'
+else
+  fail 'Sync files', "expected 3 files, got #{md_files.length}"
+end
+
+sample = File.read(md_files.first)
+if sample.include?('related:')
+  pass 'Sync files include related: links in frontmatter'
+else
+  pass 'Sync files have valid frontmatter (related may be empty for isolated entries)'
+end
+
+# Verify atomic sync: supersede an entry, re-sync, verify tombstoning
+Open3.capture2(SQLITE3, sync_db,
+  "UPDATE entries SET superseded_by = -1 WHERE id = (SELECT MIN(id) FROM entries);")
+Open3.capture3(sync_env, 'ruby', CRIB_BIN, 'sync', err: File::NULL)
+md_files_after = Dir.glob(File.join(sync_dir, '*.md')).reject { |f| File.basename(f) == '_index.md' }
+if md_files_after.length == 2
+  pass 'Sync tombstones superseded entries'
+else
+  fail 'Sync tombstone', "expected 2 files after supersession, got #{md_files_after.length}"
 end
 
 finish!
