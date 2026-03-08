@@ -141,7 +141,13 @@ KNOWLEDGE_DIR = ENV.fetch('CRIB_KNOWLEDGE_DIR') {
   File.join(File.dirname(DB_PATH), 'knowledge')
 }
 
-# Base half-lives by entry type (days)
+# Ebbinghaus decay — disabled until real access-pattern data exists to
+# calibrate half-lives. The retrieval instrumentation (last_retrieved_at,
+# retrieval_count) remains active so we accumulate the data needed to
+# design decay from evidence rather than guesses. Set CRIB_DECAY=1 to
+# re-enable.
+DECAY_ENABLED = ENV['CRIB_DECAY'] == '1'
+
 HALF_LIFE = {
   'fact'      => ENV.fetch('CRIB_HALF_LIFE_FACT',      '30').to_i,
   'lesson'    => ENV.fetch('CRIB_HALF_LIFE_LESSON',    '30').to_i,
@@ -1010,33 +1016,35 @@ def cmd_maintain
   end
   end # full
 
-  # --- Ebbinghaus decay pruning ---
+  # --- Ebbinghaus decay pruning (disabled by default) ---
   decayed_count = 0
   min_decay = 1.0
-  begin
-    active_entries = sql_query(db,
-      "SELECT id, type, created_at, last_retrieved_at, COALESCE(retrieval_count, 0) as rc " \
-      "FROM entries WHERE superseded_by IS NULL AND created_at < datetime('now', '-' || ? || ' days')",
-      [GRACE_PERIOD_DAYS])
+  if DECAY_ENABLED
+    begin
+      active_entries = sql_query(db,
+        "SELECT id, type, created_at, last_retrieved_at, COALESCE(retrieval_count, 0) as rc " \
+        "FROM entries WHERE superseded_by IS NULL AND created_at < datetime('now', '-' || ? || ' days')",
+        [GRACE_PERIOD_DAYS])
 
-    active_entries.each do |entry|
-      last_access = entry['last_retrieved_at'] || entry['created_at']
-      elapsed = (Time.now.utc - Time.parse(last_access)).to_f / 86400.0
-      base_hl = HALF_LIFE.fetch(entry['type'], HALF_LIFE['fact'])
-      eff_hl = base_hl * (1.0 + RETRIEVAL_BOOST * Math.log(1.0 + entry['rc']))
-      decay = Math.exp(-elapsed * Math.log(2) / eff_hl)
-      min_decay = decay if decay < min_decay
+      active_entries.each do |entry|
+        last_access = entry['last_retrieved_at'] || entry['created_at']
+        elapsed = (Time.now.utc - Time.parse(last_access)).to_f / 86400.0
+        base_hl = HALF_LIFE.fetch(entry['type'], HALF_LIFE['fact'])
+        eff_hl = base_hl * (1.0 + RETRIEVAL_BOOST * Math.log(1.0 + entry['rc']))
+        decay = Math.exp(-elapsed * Math.log(2) / eff_hl)
+        min_decay = decay if decay < min_decay
 
-      if decay < DECAY_ARCHIVE_THRESHOLD
-        spill_log(:debug, "decay: archiving entry ##{entry['id']} (score=#{decay.round(4)}, type=#{entry['type']})")
-        unless dry_run
-          sql_exec(db, "UPDATE entries SET superseded_by = -1 WHERE id = ? AND superseded_by IS NULL", [entry['id']])
+        if decay < DECAY_ARCHIVE_THRESHOLD
+          spill_log(:debug, "decay: archiving entry ##{entry['id']} (score=#{decay.round(4)}, type=#{entry['type']})")
+          unless dry_run
+            sql_exec(db, "UPDATE entries SET superseded_by = -1 WHERE id = ? AND superseded_by IS NULL", [entry['id']])
+          end
+          decayed_count += 1
         end
-        decayed_count += 1
       end
+    rescue => e
+      spill_log(:error, "decay pruning failed: #{e.message}")
     end
-  rescue => e
-    spill_log(:error, "decay pruning failed: #{e.message}")
   end
 
   db.close
