@@ -114,7 +114,7 @@ SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', __dir__)
 
 DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, '.state', 'crib', 'crib.db') }
 EMBEDDING_MODEL = ENV.fetch('CRIB_EMBEDDING_MODEL', 'nomic-embed-text')
-EXTRACTION_MODEL = ENV.fetch('CRIB_EXTRACTION_MODEL', 'gemma3:1b')
+EXTRACTION_MODEL = ENV.fetch('CRIB_EXTRACTION_MODEL', 'gemma3:4b')
 RERANK_MODEL = ENV.fetch('CRIB_RERANK_MODEL', 'gemma3:4b')
 OLLAMA_HOST = ENV.fetch('OLLAMA_HOST', 'http://localhost:11434')
 EMBEDDING_DIM = 768 # nomic-embed-text output dimension

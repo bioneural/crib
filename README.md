@@ -243,8 +243,8 @@ Default models can be overridden via environment variables:
 
 | Purpose | Default | Override |
 |---------|---------|----------|
-| Triple extraction | `gemma3:1b` | `CRIB_EXTRACTION_MODEL` |
-| Reranking | `gemma3:1b` | `CRIB_RERANK_MODEL` |
+| Triple extraction | `gemma3:4b` | `CRIB_EXTRACTION_MODEL` |
+| Reranking | `gemma3:4b` | `CRIB_RERANK_MODEL` |
 | Embeddings | `nomic-embed-text` | `CRIB_EMBEDDING_MODEL` |
 
 Run `bin/crib doctor` to verify all prerequisites are installed and report status as JSON.
