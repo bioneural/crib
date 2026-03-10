@@ -5,9 +5,9 @@
 #
 # Usage:
 #   test/smoke-test           # fast: skips vector and triple extraction tests
-#   test/smoke-test --full    # includes real ollama (embeddings, extraction)
+#   test/smoke-test --full    # includes real API (embeddings, extraction)
 #
-# Dependencies: ruby, sqlite3 gem, sqlite-vec, ollama (only with --full)
+# Dependencies: ruby, sqlite3 gem, sqlite-vec, ANTHROPIC_API_KEY + VOYAGE_API_KEY (only with --full)
 #
 # Behavior:
 #   1. Tests structure and syntax
@@ -36,7 +36,7 @@ test_db = File.join(tmpdir, 'test.db')
 at_exit { FileUtils.rm_rf(tmpdir) }
 
 # Base environment for subprocess calls — points at the temporary database
-# and preserves OLLAMA_HOST / PATH for shim interception.
+# and preserves ANTHROPIC_API_BASE / VOYAGE_API_BASE / PATH for mock interception.
 env = { 'CRIB_DB' => test_db, 'CRIB_LOG_LEVEL' => 'info' }
 
 # ---------------------------------------------------------------------------
@@ -278,7 +278,7 @@ if full?
     fail 'Preference reranking', "expected Ruby content, got: #{rerank_pref_out[0..200]}"
   end
 else
-  skip 'Reranker filters irrelevant preference', 'requires ollama (use --full)'
+  skip 'Reranker filters irrelevant preference', 'requires API keys (use --full)'
 end
 
 # ---------------------------------------------------------------------------
@@ -432,7 +432,7 @@ if full?
     fail 'Vector retrieval', "exited with #{vec_status.exitstatus}"
   end
 else
-  skip 'Vector write-retrieve round-trip', 'requires ollama (use --full)'
+  skip 'Vector write-retrieve round-trip', 'requires API keys (use --full)'
 end
 
 # ---------------------------------------------------------------------------
@@ -450,12 +450,12 @@ if full?
     stdin_data: "type=decision PostgreSQL is the database for the billing system\n"
   )
   if triple_status.success? && triple_err.include?('triples extracted')
-    pass 'Write extracts triples via ollama'
+    pass 'Write extracts triples via Anthropic'
   else
     fail 'Triple extraction', "expected 'triples extracted' in stderr, got: #{triple_err}"
   end
 else
-  skip 'Triple extraction via ollama', 'requires ollama (use --full)'
+  skip 'Triple extraction via Anthropic', 'requires API keys (use --full)'
 end
 
 # ---------------------------------------------------------------------------

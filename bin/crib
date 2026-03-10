@@ -34,7 +34,7 @@
 #                 When unset, all three channels run (default behavior).
 #   CRIB_DISTANCE_METRIC
 #                 Distance metric for vector search: cosine or L2.
-#                 Default: cosine (matches nomic-embed-text optimization).
+#                 Default: cosine (matches voyage-4-large optimization).
 #                 Changing this on an existing database requires dropping and
 #                 recreating the entries_vec table and re-embedding all entries.
 #   CRIB_VECTOR_THRESHOLD
@@ -60,7 +60,7 @@
 #   maintain  — JSON on stdout: {"contradictions_found":N,"corrections_linked":N,"stale_count":N,"supersessions_applied":N,"decayed_count":N,"dry_run":bool,"min_decay_score":F}
 #
 # Dependencies: Ruby stdlib plus the sqlite3 gem. No other gems.
-#               External: sqlite-vec (extension), ollama
+#               External: sqlite-vec (extension), ANTHROPIC_API_KEY, VOYAGE_API_KEY
 #
 # Behavior:
 #   write:
@@ -68,16 +68,16 @@
 #     2. Parse optional type= prefix (fact, lesson, directive)
 #     3. Initialize database if needed
 #     4. Store entry with FTS5 indexing
-#     5. Extract fact triples via ollama
+#     5. Extract fact triples via Anthropic API
 #     6. Store entities and relations (consolidation-on-write: supersedes stale facts)
-#     7. Generate embedding via ollama and store in vec0 table
+#     7. Generate embedding via Voyage API and store in vec0 table
 #
 #   retrieve:
 #     1. Read prompt from stdin
 #     2. Extract keywords
 #     3. Query three channels: triples (SQL), full-text (FTS5), vectors (sqlite-vec)
 #     4. Merge and deduplicate
-#     5. Rerank with ollama (cross-encoder logprob scoring)
+#     5. Rerank with Anthropic API (binary yes/no scoring, parallel)
 #     6. Wrap in <system-reminder> tags and output to stdout
 #     7. Update last_retrieved_at on returned entries
 #     8. Exit 0 always (fail-open)
@@ -113,11 +113,13 @@ SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', __dir__)
 # ---------------------------------------------------------------------------
 
 DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, '.state', 'crib', 'crib.db') }
-EMBEDDING_MODEL = ENV.fetch('CRIB_EMBEDDING_MODEL', 'nomic-embed-text')
-EXTRACTION_MODEL = ENV.fetch('CRIB_EXTRACTION_MODEL', 'gemma3:4b')
-RERANK_MODEL = ENV.fetch('CRIB_RERANK_MODEL', 'gemma3:4b')
-OLLAMA_HOST = ENV.fetch('OLLAMA_HOST', 'http://localhost:11434')
-EMBEDDING_DIM = 768 # nomic-embed-text output dimension
+ANTHROPIC_API_KEY = ENV['ANTHROPIC_API_KEY']
+ANTHROPIC_API_BASE = ENV.fetch('ANTHROPIC_API_BASE', 'https://api.anthropic.com')
+ANTHROPIC_MODEL = ENV.fetch('CRIB_ANTHROPIC_MODEL', 'claude-haiku-4-5-20251001')
+VOYAGE_API_KEY = ENV['VOYAGE_API_KEY']
+VOYAGE_API_BASE = ENV.fetch('VOYAGE_API_BASE', 'https://api.voyageai.com')
+VOYAGE_MODEL = ENV.fetch('CRIB_VOYAGE_MODEL', 'voyage-4-large')
+EMBEDDING_DIM = 1024 # voyage-4-large output dimension
 DISTANCE_METRIC = ENV.fetch('CRIB_DISTANCE_METRIC', 'cosine')
 VECTOR_DISTANCE_THRESHOLD = ENV.fetch('CRIB_VECTOR_THRESHOLD', '0.5').to_f
 RRF_K = ENV.fetch('CRIB_RRF_K', '60').to_i
@@ -302,18 +304,42 @@ rescue SQLite3::Exception => e
   nil
 end
 
-def call_ollama(prompt, model)
-  stdout, stderr, status = Open3.capture3('ollama', 'run', model, stdin_data: prompt)
-  unless status.success?
-    spill_log(:error, "ollama error (#{model}): #{stderr.strip}")
+def call_anthropic(prompt, max_tokens: 256)
+  unless ANTHROPIC_API_KEY
+    spill_log(:warn, 'ANTHROPIC_API_KEY not set')
     return nil
   end
-  stdout.strip
-rescue Errno::ENOENT
-  spill_log(:warn, 'ollama not found')
+
+  uri = URI("#{ANTHROPIC_API_BASE}/v1/messages")
+  req = Net::HTTP::Post.new(uri)
+  req['Content-Type'] = 'application/json'
+  req['x-api-key'] = ANTHROPIC_API_KEY
+  req['anthropic-version'] = '2023-06-01'
+
+  req.body = JSON.generate({
+    model: ANTHROPIC_MODEL,
+    max_tokens: max_tokens,
+    temperature: 0,
+    messages: [{ role: 'user', content: prompt }]
+  })
+
+  http = Net::HTTP.new(uri.hostname, uri.port)
+  http.use_ssl = uri.scheme == 'https'
+  http.read_timeout = 30
+  response = http.request(req)
+
+  unless response.is_a?(Net::HTTPSuccess)
+    spill_log(:error, "anthropic error: HTTP #{response.code}")
+    return nil
+  end
+
+  data = JSON.parse(response.body)
+  data.dig('content', 0, 'text')
+rescue Errno::ECONNREFUSED
+  spill_log(:warn, 'anthropic API unreachable (connection refused)')
   nil
 rescue => e
-  spill_log(:error, "ollama failed: #{e.message}")
+  spill_log(:error, "anthropic failed: #{e.message}")
   nil
 end
 
@@ -364,29 +390,41 @@ def init_db
   end
 end
 
-def ollama_embed(text)
-  spill_log(:debug, "embedding #{text.length} chars with #{EMBEDDING_MODEL}")
-  uri = URI("#{OLLAMA_HOST}/api/embed")
-  req = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
-  req.body = JSON.generate({ model: EMBEDDING_MODEL, input: text })
-
-  response = Net::HTTP.start(uri.hostname, uri.port) do |http|
-    http.read_timeout = 30
-    http.request(req)
+def voyage_embed(text)
+  spill_log(:debug, "embedding #{text.length} chars with #{VOYAGE_MODEL}")
+  unless VOYAGE_API_KEY
+    spill_log(:warn, 'VOYAGE_API_KEY not set')
+    return nil
   end
 
+  uri = URI("#{VOYAGE_API_BASE}/v1/embeddings")
+  req = Net::HTTP::Post.new(uri)
+  req['Content-Type'] = 'application/json'
+  req['Authorization'] = "Bearer #{VOYAGE_API_KEY}"
+
+  req.body = JSON.generate({
+    model: VOYAGE_MODEL,
+    input: [text],
+    output_dimension: EMBEDDING_DIM
+  })
+
+  http = Net::HTTP.new(uri.hostname, uri.port)
+  http.use_ssl = uri.scheme == 'https'
+  http.read_timeout = 30
+  response = http.request(req)
+
   unless response.is_a?(Net::HTTPSuccess)
-    spill_log(:error, "ollama embed error: HTTP #{response.code}")
+    spill_log(:error, "voyage embed error: HTTP #{response.code}")
     return nil
   end
 
   data = JSON.parse(response.body)
-  data['embeddings']&.first
+  data.dig('data', 0, 'embedding')
 rescue Errno::ECONNREFUSED
-  spill_log(:warn, 'ollama not running (connection refused)')
+  spill_log(:warn, 'voyage API unreachable (connection refused)')
   nil
 rescue => e
-  spill_log(:error, "ollama embed failed: #{e.message}")
+  spill_log(:error, "voyage embed failed: #{e.message}")
   nil
 end
 
@@ -401,7 +439,7 @@ def store_entry(db, type, content, source = 'agent')
 end
 
 def extract_triples(text)
-  spill_log(:debug, "extracting triples with #{EXTRACTION_MODEL}")
+  spill_log(:debug, "extracting triples with #{ANTHROPIC_MODEL}")
   prompt = <<~PROMPT
     Extract factual relationships from the following text as JSON.
     Return a JSON array of objects, each with "subject", "predicate", "object", and "subject_type", "object_type" fields.
@@ -413,7 +451,7 @@ def extract_triples(text)
     Text: #{text}
   PROMPT
 
-  result = call_ollama(prompt, EXTRACTION_MODEL)
+  result = call_anthropic(prompt)
   return [] if result.nil? || result.empty?
 
   json_str = result[/\[.*\]/m]
@@ -457,7 +495,7 @@ def store_triple(db, subject_name, subject_type, predicate, object_name, object_
 end
 
 def generate_embedding(text)
-  ollama_embed(text)
+  voyage_embed(text)
 end
 
 def store_embedding(vec_db, entry_id, embedding)
@@ -606,7 +644,7 @@ end
 def query_vector(vec_db, prompt)
   return [] if vec_db.nil?
 
-  embedding = ollama_embed(prompt)
+  embedding = voyage_embed(prompt)
   return [] if embedding.nil?
 
   json_vec = JSON.generate(embedding)
@@ -694,10 +732,13 @@ end
 def cross_encoder_rerank(prompt, entries)
   return entries if entries.empty?
 
-  scored = entries.map { |entry|
-    score = rerank_score(prompt, entry['content'])
-    entry.merge('rerank_score' => score)
+  threads = entries.map { |entry|
+    Thread.new {
+      score = rerank_score(prompt, entry['content'])
+      entry.merge('rerank_score' => score)
+    }
   }
+  scored = threads.map(&:value)
   scored.select { |e| e['rerank_score'] > RERANK_THRESHOLD }
         .sort_by { |e| -e['rerank_score'] }
         .first(RERANK_LIMIT)
@@ -707,55 +748,17 @@ rescue => e
 end
 
 def rerank_score(prompt, document)
-  uri = URI("#{OLLAMA_HOST}/api/chat")
-  req = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
-
   rerank_prompt = "Judge whether the Document is relevant to the Query. " \
     "Answer exactly \"yes\" or \"no\", nothing else.\n\n" \
     "Query: #{prompt}\n\nDocument: #{document}"
 
-  req.body = JSON.generate({
-    model: RERANK_MODEL,
-    messages: [{ role: 'user', content: rerank_prompt }],
-    stream: false,
-    logprobs: true,
-    top_logprobs: 10,
-    options: { temperature: 0.0, num_predict: 1 }
-  })
+  result = call_anthropic(rerank_prompt, max_tokens: 1)
+  return 0.0 if result.nil?
 
-  response = Net::HTTP.start(uri.hostname, uri.port) do |http|
-    http.read_timeout = 30
-    http.request(req)
-  end
-
-  return 0.0 unless response.is_a?(Net::HTTPSuccess)
-
-  data = JSON.parse(response.body)
-  top = data.dig('logprobs', 0, 'top_logprobs')
-  return 0.0 unless top
-
-  yes_lp = nil
-  no_lp = nil
-  top.each do |t|
-    token = t['token'].strip.downcase
-    yes_lp = t['logprob'] if token == 'yes' && yes_lp.nil?
-    no_lp = t['logprob'] if token == 'no' && no_lp.nil?
-  end
-
-  score = if yes_lp && no_lp
-             yes_p = Math.exp(yes_lp)
-             no_p = Math.exp(no_lp)
-             yes_p / (yes_p + no_p)
-           elsif yes_lp
-             1.0
-           else
-             0.0
-           end
+  answer = result.strip.downcase
+  score = answer.start_with?('yes') ? 1.0 : 0.0
   spill_log(:debug, "rerank score=#{score.round(3)} for: #{document[0, 80]}")
   score
-rescue Errno::ECONNREFUSED
-  spill_log(:warn, 'ollama not running (connection refused), skipping rerank')
-  raise
 rescue => e
   spill_log(:error, "rerank_score failed: #{e.message}")
   0.0
@@ -960,7 +963,7 @@ def cmd_maintain
     vec_db = open_db_vec
 
     corrections.each do |correction|
-      embedding = ollama_embed(correction['content'])
+      embedding = voyage_embed(correction['content'])
       next if embedding.nil? || vec_db.nil?
 
       json_vec = JSON.generate(embedding)
@@ -1101,33 +1104,15 @@ def cmd_doctor
     }
   end
 
-  # ollama
-  ollama_out, ollama_status = Open3.capture2('ollama', '--version')
-  report['ollama'] = {
-    'version' => ollama_status.success? ? ollama_out.strip : nil,
-    'ok' => ollama_status.success?
-  }
+  # Anthropic API key
+  has_anthropic = !ANTHROPIC_API_KEY.nil? && !ANTHROPIC_API_KEY.empty?
+  report['anthropic_api_key'] = { 'ok' => has_anthropic }
+  report['anthropic_api_key']['error'] = 'ANTHROPIC_API_KEY not set' unless has_anthropic
 
-  # ollama reachable
-  begin
-    uri = URI("#{OLLAMA_HOST}/api/tags")
-    response = Net::HTTP.get_response(uri)
-    models = []
-    if response.is_a?(Net::HTTPSuccess)
-      data = JSON.parse(response.body)
-      models = (data['models'] || []).map { |m| m['name'] }
-    end
-    report['ollama_api'] = { 'host' => OLLAMA_HOST, 'ok' => response.is_a?(Net::HTTPSuccess) }
-  rescue => e
-    report['ollama_api'] = { 'host' => OLLAMA_HOST, 'ok' => false, 'error' => e.message }
-    models = []
-  end
-
-  # Models
-  [EXTRACTION_MODEL, RERANK_MODEL, EMBEDDING_MODEL].uniq.each do |model|
-    present = models.any? { |m| m.start_with?(model) }
-    report["model:#{model}"] = { 'ok' => present }
-  end
+  # Voyage API key
+  has_voyage = !VOYAGE_API_KEY.nil? && !VOYAGE_API_KEY.empty?
+  report['voyage_api_key'] = { 'ok' => has_voyage }
+  report['voyage_api_key']['error'] = 'VOYAGE_API_KEY not set' unless has_voyage
 
   # Database
   report['database'] = {
@@ -1422,15 +1407,66 @@ def usage
   exit 1
 end
 
+def cmd_migrate_embeddings
+  unless db_exists?
+    spill_log(:info, "no database to migrate embeddings")
+    exit 0
+  end
+
+  unless VOYAGE_API_KEY
+    spill_log(:error, "VOYAGE_API_KEY is required for embedding migration")
+    exit 1
+  end
+
+  db = open_db
+  run_migrations(db)
+
+  entries = sql_query(db, "SELECT id, content FROM entries WHERE superseded_by IS NULL;")
+  spill_log(:info, "migrate-embeddings: #{entries.length} entries to re-embed")
+
+  vec_db = open_db_vec
+  unless vec_db
+    spill_log(:error, "cannot open vec database")
+    db.close
+    exit 1
+  end
+
+  # Drop and recreate vec table with new dimension
+  begin
+    vec_db.execute("DROP TABLE IF EXISTS entries_vec;")
+    vec_db.execute_batch(VEC_SCHEMA)
+  rescue SQLite3::Exception => e
+    spill_log(:error, "failed to recreate vec table: #{e.message}")
+    db.close
+    vec_db.close
+    exit 1
+  end
+
+  embedded = 0
+  entries.each do |entry|
+    embedding = voyage_embed(entry['content'])
+    if embedding
+      store_embedding(vec_db, entry['id'], embedding)
+      embedded += 1
+    end
+    spill_log(:info, "migrate-embeddings: #{embedded}/#{entries.length}") if embedded % 50 == 0
+  end
+
+  db.close
+  vec_db.close
+  spill_log(:info, "migrate-embeddings: complete — #{embedded}/#{entries.length} entries re-embedded")
+end
+
 command = ARGV.shift
 case command
-when 'write'    then cmd_write
-when 'retrieve' then cmd_retrieve
-when 'init'     then cmd_init
-when 'doctor'   then cmd_doctor
-when 'maintain' then cmd_maintain
-when 'migrate'  then cmd_migrate
-when 'sync'     then cmd_sync
-when 'correct'  then cmd_correct
+when 'write'             then cmd_write
+when 'retrieve'          then cmd_retrieve
+when 'init'              then cmd_init
+when 'doctor'            then cmd_doctor
+when 'maintain'          then cmd_maintain
+when 'migrate'           then cmd_migrate
+when 'migrate-embeddings' then cmd_migrate_embeddings
+when 'sync'              then cmd_sync
+when 'correct'           then cmd_correct
 else usage
 end
