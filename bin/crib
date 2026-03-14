@@ -33,30 +33,10 @@
 #   bin/crib maintain
 #
 # Environment:
-#   CRIB_DB       Path to the SQLite database file.
-#                 Default: .state/crib/crib.db (relative to cwd)
-#   CRIB_CHANNEL  Isolate a single retrieval channel: triples, fts, or vector.
-#                 When unset, all three channels run (default behavior).
-#   CRIB_DISTANCE_METRIC
-#                 Distance metric for vector search: cosine or L2.
-#                 Default: cosine (matches voyage-4-large optimization).
-#                 Changing this on an existing database requires dropping and
-#                 recreating the entries_vec table and re-embedding all entries.
-#   CRIB_VECTOR_THRESHOLD
-#                 Maximum vector distance for results. Entries beyond this
-#                 distance are filtered out. Default: 0.5 (cosine).
-#                 If using L2 metric, a threshold of 1.0 is equivalent.
-#   CRIB_RRF_K    Reciprocal Rank Fusion smoothing constant. Higher values
-#                 reduce the influence of high-ranked results. Default: 60
-#                 (per Cormack et al. 2009).
-#   CRIB_RERANK_THRESHOLD
-#                 Minimum rerank score for results. Entries at or below this
-#                 score are filtered out. Default: 0.5 (the model must be
-#                 more confident "relevant" than "irrelevant"). Set to 0.0
-#                 to pass anything the model leans toward, or -1 to disable.
-#   CRIB_LOG_LEVEL
-#                 Minimum log level for stderr output: debug, info, warn, error.
-#                 Default: warn (production). Set to debug for detailed tracing.
+#   ANTHROPIC_API_KEY  Required for triple extraction, reranking, and consolidation.
+#   VOYAGE_API_KEY     Required for vector embeddings.
+#   CRIB_DB            Path to the SQLite database file.
+#                      Default: .state/crib/crib.db (relative to cwd)
 #
 # Output:
 #   write     — status on stderr, nothing on stdout
@@ -108,7 +88,7 @@ require 'time'
 require 'sqlite3'
 
 SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
-LOG_LEVEL = ENV.fetch('CRIB_LOG_LEVEL', 'warn')
+LOG_LEVEL = 'info'
 if File.directory?(SPILL_HOME)
   require File.join(SPILL_HOME, 'lib', 'spill')
   Spill.configure(tool: 'crib', level: LOG_LEVEL)
@@ -122,26 +102,28 @@ SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', __dir__)
 
 DB_PATH = ENV.fetch('CRIB_DB') { File.join(Dir.pwd, '.state', 'crib', 'crib.db') }
 ANTHROPIC_API_KEY = ENV['ANTHROPIC_API_KEY']
-ANTHROPIC_API_BASE = ENV.fetch('ANTHROPIC_API_BASE', 'https://api.anthropic.com')
-ANTHROPIC_MODEL = ENV.fetch('CRIB_ANTHROPIC_MODEL', 'claude-haiku-4-5-20251001')
+ANTHROPIC_API_BASE = 'https://api.anthropic.com'
+ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001'
 VOYAGE_API_KEY = ENV['VOYAGE_API_KEY']
-VOYAGE_API_BASE = ENV.fetch('VOYAGE_API_BASE', 'https://api.voyageai.com')
-VOYAGE_MODEL = ENV.fetch('CRIB_VOYAGE_MODEL', 'voyage-4-large')
-EMBEDDING_DIM = 1024 # voyage-4-large output dimension
-DISTANCE_METRIC = ENV.fetch('CRIB_DISTANCE_METRIC', 'cosine')
-VECTOR_DISTANCE_THRESHOLD = ENV.fetch('CRIB_VECTOR_THRESHOLD', '0.5').to_f
-RRF_K = ENV.fetch('CRIB_RRF_K', '60').to_i
+VOYAGE_API_BASE = 'https://api.voyageai.com'
+VOYAGE_MODEL = 'voyage-4-large'
+EMBEDDING_DIM = 1024
+DISTANCE_METRIC = 'cosine'
+VECTOR_DISTANCE_THRESHOLD = 0.5
+RRF_K = 60
 RRF_LIMIT = 20
 RERANK_LIMIT = 10
-RERANK_THRESHOLD = ENV.fetch('CRIB_RERANK_THRESHOLD', '0.5').to_f
+RERANK_THRESHOLD = 0.5
 FTS_CANDIDATES = 20
 VECTOR_CANDIDATES = 20
 
-# sqlite-vec extension: auto-detect via Python package or override via env var.
-VEC_EXTENSION = ENV.fetch('CRIB_VEC_EXTENSION') {
+# sqlite-vec extension: auto-detect via Python package.
+VEC_EXTENSION = begin
   detected, status = Open3.capture2('python3', '-c', 'import sqlite_vec; print(sqlite_vec.loadable_path())')
   status.success? ? detected.strip : 'vec0'
-}
+rescue
+  'vec0'
+end
 TOKEN_BUDGET = 2000
 CHAR_BUDGET = TOKEN_BUDGET * 4
 
@@ -151,27 +133,21 @@ CONSOLIDATION_BATCH_SIZE = 12
 CONSOLIDATION_MAX_BATCHES = 3
 CONSOLIDATION_MIN_ENTRIES = 3
 HINTS_CAP = 5
+PREF_LIMIT = 5
 
-KNOWLEDGE_DIR = ENV.fetch('CRIB_KNOWLEDGE_DIR') {
-  File.join(File.dirname(DB_PATH), 'knowledge')
-}
+KNOWLEDGE_DIR = File.join(File.dirname(DB_PATH), 'knowledge')
 
-# Ebbinghaus decay — disabled until real access-pattern data exists to
-# calibrate half-lives. The retrieval instrumentation (last_retrieved_at,
-# retrieval_count) remains active so we accumulate the data needed to
-# design decay from evidence rather than guesses. Set CRIB_DECAY=1 to
-# re-enable.
-DECAY_ENABLED = ENV['CRIB_DECAY'] == '1'
+DECAY_ENABLED = true
 
 HALF_LIFE = {
-  'fact'      => ENV.fetch('CRIB_HALF_LIFE_FACT',      '30').to_i,
-  'lesson'    => ENV.fetch('CRIB_HALF_LIFE_LESSON',    '30').to_i,
-  'directive' => ENV.fetch('CRIB_HALF_LIFE_DIRECTIVE', '180').to_i,
+  'fact'      => 30,
+  'lesson'    => 30,
+  'directive' => 180,
 }.freeze
 
-DECAY_ARCHIVE_THRESHOLD = ENV.fetch('CRIB_DECAY_THRESHOLD', '0.05').to_f
-RETRIEVAL_BOOST         = ENV.fetch('CRIB_RETRIEVAL_BOOST', '0.15').to_f
-GRACE_PERIOD_DAYS       = ENV.fetch('CRIB_GRACE_PERIOD',    '7').to_i
+DECAY_ARCHIVE_THRESHOLD = 0.05
+RETRIEVAL_BOOST         = 0.15
+GRACE_PERIOD_DAYS       = 7
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -924,7 +900,7 @@ def cmd_retrieve
   # Only inject when running all channels (no channel isolation)
   pref_entries = []
   unless channel
-    pref_limit = ENV.fetch('CRIB_PREF_LIMIT', '5').to_i
+    pref_limit = PREF_LIMIT
     pref_entries = sql_query(db,
       "SELECT id, type, content, created_at, source FROM entries " \
       "WHERE type = 'directive' AND superseded_by IS NULL " \

@@ -102,19 +102,10 @@ The optional `type=` prefix on write categorizes entries:
 
 ### Environment variables
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `CRIB_DB` | `.state/crib/crib.db` | Path to the SQLite database |
-| `CRIB_VEC_EXTENSION` | auto-detected | Path to the sqlite-vec `vec0` extension |
-| `CRIB_CHANNEL` | all channels | Isolate a single retrieval channel: `triples`, `fts`, or `vector` |
-| `CRIB_DISTANCE_METRIC` | `cosine` | Distance metric for vector search: `cosine` or `L2` |
-| `CRIB_VECTOR_THRESHOLD` | `0.5` | Maximum vector distance — entries beyond this are filtered out |
-| `CRIB_RRF_K` | `60` | RRF smoothing constant (per Cormack et al. 2009) |
-| `CRIB_RERANK_THRESHOLD` | `0.5` | Minimum rerank score — entries at or below this are filtered out |
-| `CRIB_DECAY` | disabled | Set to `1` to enable Ebbinghaus decay pruning |
-| `CRIB_LOG_LEVEL` | `warn` | Minimum log level: `debug`, `info`, `warn`, `error` |
-
-Model overrides are documented in [Prerequisites](#prerequisites).
+| Variable | Purpose |
+|----------|---------|
+| `ANTHROPIC_API_KEY` | Required for triple extraction, reranking, and consolidation |
+| `VOYAGE_API_KEY` | Required for vector embeddings |
 
 ---
 

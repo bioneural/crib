@@ -37,7 +37,7 @@ at_exit { FileUtils.rm_rf(tmpdir) }
 
 # Base environment for subprocess calls — points at the temporary database
 # and preserves ANTHROPIC_API_BASE / VOYAGE_API_BASE / PATH for mock interception.
-env = { 'CRIB_DB' => test_db, 'CRIB_LOG_LEVEL' => 'info' }
+env = { 'CRIB_DB' => test_db }
 
 # ---------------------------------------------------------------------------
 # Structure
@@ -316,7 +316,7 @@ section 'Decay'
 
 # Decay pruning: write a note, backdate it 200 days, run maintain, confirm superseded_by = -1
 decay_db = File.join(tmpdir, 'decay.db')
-decay_env = env.merge('CRIB_DB' => decay_db, 'CRIB_DECAY' => '1')
+decay_env = env.merge('CRIB_DB' => decay_db)
 
 Open3.capture3(decay_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
@@ -348,7 +348,7 @@ end
 
 # Dry-run: write a note, backdate it, run maintain --dry-run, confirm NOT pruned but decayed_count > 0
 dryrun_db = File.join(tmpdir, 'dryrun.db')
-dryrun_env = env.merge('CRIB_DB' => dryrun_db, 'CRIB_DECAY' => '1')
+dryrun_env = env.merge('CRIB_DB' => dryrun_db)
 
 Open3.capture3(dryrun_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
@@ -378,7 +378,7 @@ end
 
 # Grace period: write a note, backdate it just 3 days (within 7-day grace), run maintain, confirm it survives
 grace_db = File.join(tmpdir, 'grace.db')
-grace_env = env.merge('CRIB_DB' => grace_db, 'CRIB_DECAY' => '1')
+grace_env = env.merge('CRIB_DB' => grace_db)
 
 Open3.capture3(grace_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
