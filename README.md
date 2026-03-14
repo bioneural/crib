@@ -94,11 +94,10 @@ The optional `type=` prefix on write categorizes entries:
 
 | Type | Purpose |
 |------|---------|
-| `note` | General knowledge or context (default) |
-| `decision` | A choice made and why |
-| `correction` | Something previously believed that turned out wrong |
-| `error` | A failure that occurred and what was learned |
-| `interest` | A topic the agent is tracking for external intelligence |
+| `fact` | General knowledge or context (default) |
+| `lesson` | Something learned from experience or error |
+| `directive` | A standing instruction or preference |
+| `insight` | Synthesized by consolidation (created automatically by maintain) |
 
 ### Environment variables
 
@@ -179,6 +178,7 @@ CREATE TABLE entries (
   content TEXT NOT NULL,
   embedding BLOB,
   created_at TEXT DEFAULT (datetime('now')),
+  source TEXT NOT NULL DEFAULT 'agent',
   last_retrieved_at TEXT,
   superseded_by INTEGER,
   consolidated_at TEXT
@@ -241,16 +241,9 @@ Tests cover structure, syntax, doctor, init, write, retrieve, preference reranki
 
 - Ruby 3.x
 - Ruby sqlite3 gem (handles extension loading natively — no Homebrew sqlite3 binary needed)
-- [sqlite-vec](https://github.com/asg017/sqlite-vec) (`pip3 install sqlite-vec`)
-- `ANTHROPIC_API_KEY` — for triple extraction, reranking, and consolidation
-- `VOYAGE_API_KEY` — for vector embeddings
-
-Default models can be overridden via environment variables:
-
-| Purpose | Default | Override |
-|---------|---------|----------|
-| Triple extraction / reranking / consolidation | `claude-haiku-4-5-20251001` | `CRIB_ANTHROPIC_MODEL` |
-| Embeddings | `voyage-4-large` | `CRIB_VOYAGE_MODEL` |
+- [sqlite-vec](https://github.com/asg017/sqlite-vec) (`pip3 install sqlite-vec` — the Python package provides the loadable extension)
+- `ANTHROPIC_API_KEY` — for triple extraction, reranking, and consolidation (claude-haiku-4-5)
+- `VOYAGE_API_KEY` — for vector embeddings (voyage-4-large)
 
 Run `bin/crib doctor` to verify all prerequisites are installed and report status as JSON.
 
