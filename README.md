@@ -4,9 +4,9 @@
   <sub>memory storage and retrieval for AI agents</sub>
 </h1>
 
-Agents forget between sessions. Decisions made yesterday are relitigated today. Context that shaped a choice evaporates before the next prompt arrives. Crib is the storage layer that solves this — one SQLite database with three query channels, consolidation-on-write so the archive stays clean, and a retrieval command that surfaces what's relevant for a given prompt.
+Agents forget between sessions. Decisions made yesterday are relitigated today. Context that shaped a choice evaporates before the next prompt arrives. Crib is the storage layer that solves this — one SQLite database with three query channels, generative consolidation that synthesizes cross-cutting insights, bidirectional connection graphs that discover latent relationships, and a retrieval command that surfaces what's relevant for a given prompt.
 
-A single script. Ruby stdlib plus the sqlite3 gem. No other gems, no API keys. Ollama runs locally for embeddings and extraction.
+A single script. Ruby stdlib plus the sqlite3 gem. Anthropic and Voyage APIs for extraction, reranking, and embeddings.
 
 ---
 
@@ -26,11 +26,31 @@ A fact triple represents a single relationship between two things: `(subject, pr
 
 Triples are precise where full-text search is fuzzy. Ask "what are ClientA's terms?" and a keyword search has to hope the right document surfaces. A triple query walks directly from the entity `ClientA` through the predicate `payment_terms` to the answer `Net30` — one SQL JOIN, no ranking, no ambiguity.
 
-Crib extracts triples automatically on write using ollama. You write natural text; crib stores both the text (for full-text search) and the structured facts (for precise recall). When a new fact contradicts an old one, the old triple is superseded — marked with a `valid_until` timestamp rather than deleted. History is preserved but current queries return only what's true now.
+Crib extracts triples automatically on write via the Anthropic API. You write natural text; crib stores both the text (for full-text search) and the structured facts (for precise recall). When a new fact contradicts an old one, the old triple is superseded — marked with a `valid_until` timestamp rather than deleted. History is preserved but current queries return only what's true now.
 
-**Write path** — text arrives on stdin. Crib stores it as a full-text entry, generates a vector embedding via ollama, extracts fact triples, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
+**Write path** — text arrives on stdin. Crib stores it as a full-text entry, generates a vector embedding via the Voyage API, extracts fact triples via the Anthropic API, and performs consolidation-on-write: if a new fact supersedes an existing one, the old relation is marked `valid_until` rather than duplicated. The archive stays clean without manual curation.
 
-**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. FTS and vector results are merged using Reciprocal Rank Fusion (RRF) — entries found by both channels score higher than single-channel results. A vector distance threshold filters noise before fusion. The fused results are then reranked using a cross-encoder: ollama scores each query-document pair by extracting logprobs from a yes/no relevance judgment, and entries below a rerank threshold are discarded. The surviving results are wrapped in `<memory>` tags with a `context_time` timestamp. Each fact triple includes its `valid_from` date; each memory entry includes its `created_at` date. The consuming agent can reason about recency — whether a memory is older or newer than what's already in the conversation. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
+**Read path** — a prompt arrives on stdin. Crib extracts keywords and generates an embedding of the prompt, then queries all three channels: triples via SQL JOINs, full-text via FTS5, and similar entries via sqlite-vec nearest neighbors. FTS and vector results are merged using Reciprocal Rank Fusion (RRF) — entries found by both channels score higher than single-channel results. A vector distance threshold filters noise before fusion. The fused results are then reranked using a cross-encoder: the Anthropic API scores each query-document pair with a yes/no relevance judgment, and entries below a rerank threshold are discarded. After reranking, a single-hop graph expansion queries the connections table for entries connected to the top results, appending them as "Connected memories." The surviving results are wrapped in `<system-reminder>` tags. Each fact triple includes its `valid_from` date; each memory entry includes its `created_at` date. The consuming agent can reason about recency. Empty output means nothing relevant was found. Fail-open — a broken retrieval never blocks the agent.
+
+### Generative consolidation
+
+During `maintain`, crib batches unconsolidated entries and calls the Anthropic API to synthesize cross-cutting insights. Each insight is stored as an entry with `type=insight` and `source=consolidation`, so it automatically participates in all three retrieval channels. The `consolidations` table tracks provenance — which source entries contributed to each insight. Entries are marked `consolidated_at` after processing and are not reprocessed on subsequent runs.
+
+### Connection graphs
+
+The same consolidation API call also identifies pairs of meaningfully connected entries. These are stored in a `connections` table with canonical ordering (`entry_id_a < entry_id_b`) and a `strength` counter that increments when the same connection is rediscovered across runs. During retrieval, a single-hop graph expansion surfaces entries connected to the top results, ordered by strength. Connections represent relationships between *memories* (entry IDs), distinct from triples which represent relationships between *entities*.
+
+### Hints
+
+`crib hints` returns lightweight topic-level nudges — not full memory content, just enough for the agent to know relevant memories exist. Hooker wraps these in `<system-reminder>` tags and injects them. The agent sees the nudges and can call `crib retrieve` deliberately for full content.
+
+```sh
+echo "what database did we choose?" | bin/crib hints
+# You have 3 stored memories about sqlite.
+# You have a standing directive about storage.
+```
+
+Hints use FTS5 and triples only (no API calls) for speed. Output is capped at 5 lines. Empty output on any error. Exit 0 always.
 
 ---
 
@@ -59,9 +79,13 @@ bin/crib init
 bin/crib doctor
 # { "ruby": { "version": "3.x", "ok": true }, ... "ok": true }
 
-# Run memory maintenance — contradiction detection, correction linking, staleness
+# Get lightweight topic hints for a prompt (no API calls)
+echo "what database did we choose?" | bin/crib hints
+# You have 3 stored memories about sqlite.
+
+# Run memory maintenance — contradiction detection, correction linking, consolidation
 bin/crib maintain
-# {"contradictions_found":1,"corrections_linked":0,"stale_count":3,"supersessions_applied":1}
+# {"contradictions_found":1,"corrections_linked":0,"stale_count":3,"supersessions_applied":1,"consolidations_generated":2,"connections_discovered":3}
 ```
 
 ### Entry types
@@ -86,8 +110,9 @@ The optional `type=` prefix on write categorizes entries:
 | `CRIB_DISTANCE_METRIC` | `cosine` | Distance metric for vector search: `cosine` or `L2` |
 | `CRIB_VECTOR_THRESHOLD` | `0.5` | Maximum vector distance — entries beyond this are filtered out |
 | `CRIB_RRF_K` | `60` | RRF smoothing constant (per Cormack et al. 2009) |
-| `CRIB_RERANK_THRESHOLD` | `0.0` | Minimum rerank score — entries at or below this are filtered out |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
+| `CRIB_RERANK_THRESHOLD` | `0.5` | Minimum rerank score — entries at or below this are filtered out |
+| `CRIB_DECAY` | disabled | Set to `1` to enable Ebbinghaus decay pruning |
+| `CRIB_LOG_LEVEL` | `warn` | Minimum log level: `debug`, `info`, `warn`, `error` |
 
 Model overrides are documented in [Prerequisites](#prerequisites).
 
@@ -164,7 +189,8 @@ CREATE TABLE entries (
   embedding BLOB,
   created_at TEXT DEFAULT (datetime('now')),
   last_retrieved_at TEXT,
-  superseded_by INTEGER
+  superseded_by INTEGER,
+  consolidated_at TEXT
 );
 
 CREATE VIRTUAL TABLE entries_fts USING fts5(
@@ -175,60 +201,48 @@ CREATE VIRTUAL TABLE entries_fts USING fts5(
 
 -- Vector embeddings (semantic similarity)
 CREATE VIRTUAL TABLE entries_vec USING vec0(
-  embedding float[768]
+  embedding float[1024]
+);
+
+-- Consolidation provenance
+CREATE TABLE consolidations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  content TEXT NOT NULL,
+  source_entry_ids TEXT NOT NULL,   -- JSON array of entry IDs
+  created_at TEXT DEFAULT (datetime('now')),
+  superseded_by INTEGER
+);
+
+-- Bidirectional connection graph
+CREATE TABLE connections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id_a INTEGER NOT NULL,
+  entry_id_b INTEGER NOT NULL,
+  relationship TEXT NOT NULL,
+  strength REAL DEFAULT 1.0,        -- reinforced when rediscovered
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(entry_id_a, entry_id_b)    -- canonical order: a < b
 );
 ```
 
 Triples use bi-temporal validity — `valid_from` / `valid_until` on relations. A query for current facts filters on `valid_until IS NULL`. Old facts are superseded, not deleted.
 
-Vector embeddings are stored in a sqlite-vec `vec0` virtual table. Each entry's embedding is a 768-dimensional float vector (nomic-embed-text default). Retrieval generates an embedding of the prompt and finds nearest neighbors.
+Vector embeddings are stored in a sqlite-vec `vec0` virtual table. Each entry's embedding is a 1024-dimensional float vector (voyage-4-large). Retrieval generates an embedding of the prompt and finds nearest neighbors.
+
+Consolidations track provenance — which source entries contributed to each synthesized insight. Insights are stored as regular entries (`type=insight`, `source=consolidation`) so they participate in all retrieval channels automatically.
+
+Connections record discovered relationships between memory entries. The `strength` counter increments when the same pair is rediscovered across maintain runs, helping retrieval prioritize well-established connections over one-off hallucinations.
 
 ---
 
 ## Smoke tests
 
 ```
-$ bin/smoke-test
-
-Doctor
-  ✓ Doctor reports all prerequisites OK
-  ✓ Doctor output is valid JSON
-
-Init
-  ✓ Init creates database
-  ✓ Database file exists after init
-  ✓ Database has all expected tables
-  ✓ Vec0 virtual table exists
-
-Write
-  ✓ Write stores entry and reports success
-  ✓ Write respects type= prefix
-  ✓ Write extracts triples
-  ✓ Write rejects empty input
-
-Retrieve
-  ✓ Retrieve finds entries via FTS5
-  ✓ Retrieve finds fact triples
-  ✓ Retrieve finds entries via vector similarity
-  ✓ Retrieve wraps output in <memory> tags
-  ✓ Retrieve includes context_time on <memory> tag
-  ✓ Retrieve entries include date prefix
-  ✓ Retrieve triples include since date
-  ✓ Retrieve orders entries newest-first
-  ✓ Retrieve with empty input exits cleanly
-  ✓ Retrieve with missing database exits cleanly
-
-Consolidation
-  ✓ Consolidation-on-write runs without error
-
-Rerank threshold
-  ✓ Rerank threshold filters out irrelevant results
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-22 passed
+$ test/smoke-test
+46 passed, 3 skipped
 ```
 
-Tests run against a temporary database that is created and destroyed on each run. No artifacts are left behind.
+Tests cover structure, syntax, doctor, init, write, retrieve, preference reranking, maintain, decay, write-time dedup, provenance, correct, migration, consolidation schema, consolidation idempotency, connection discovery, connection retrieval, hints, and sync. Tests run against a temporary database that is created and destroyed on each run. No artifacts are left behind. The 3 skipped tests require API keys — run with `--full` to include them.
 
 ---
 
@@ -237,15 +251,15 @@ Tests run against a temporary database that is created and destroyed on each run
 - Ruby 3.x
 - Ruby sqlite3 gem (handles extension loading natively — no Homebrew sqlite3 binary needed)
 - [sqlite-vec](https://github.com/asg017/sqlite-vec) (`pip3 install sqlite-vec`)
-- [Ollama](https://ollama.com) with the default models pulled (see below)
+- `ANTHROPIC_API_KEY` — for triple extraction, reranking, and consolidation
+- `VOYAGE_API_KEY` — for vector embeddings
 
 Default models can be overridden via environment variables:
 
 | Purpose | Default | Override |
 |---------|---------|----------|
-| Triple extraction | `gemma3:4b` | `CRIB_EXTRACTION_MODEL` |
-| Reranking | `gemma3:4b` | `CRIB_RERANK_MODEL` |
-| Embeddings | `nomic-embed-text` | `CRIB_EMBEDDING_MODEL` |
+| Triple extraction / reranking / consolidation | `claude-haiku-4-5-20251001` | `CRIB_ANTHROPIC_MODEL` |
+| Embeddings | `voyage-4-large` | `CRIB_VOYAGE_MODEL` |
 
 Run `bin/crib doctor` to verify all prerequisites are installed and report status as JSON.
 

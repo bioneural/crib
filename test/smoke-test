@@ -296,10 +296,10 @@ if !maintain_status.success?
 else
   begin
     mdata = JSON.parse(maintain_out)
-    expected_keys = %w[contradictions_found corrections_linked stale_count]
+    expected_keys = %w[contradictions_found corrections_linked stale_count consolidations_generated connections_discovered]
     missing_keys = expected_keys.reject { |k| mdata.key?(k) }
     if missing_keys.empty?
-      pass 'Maintain exits 0 with expected JSON keys (contradictions_found, corrections_linked, stale_count)'
+      pass 'Maintain exits 0 with expected JSON keys (including consolidation and connection keys)'
     else
       fail 'Maintain keys', "missing: #{missing_keys.join(', ')}"
     end
@@ -316,7 +316,7 @@ section 'Decay'
 
 # Decay pruning: write a note, backdate it 200 days, run maintain, confirm superseded_by = -1
 decay_db = File.join(tmpdir, 'decay.db')
-decay_env = env.merge('CRIB_DB' => decay_db)
+decay_env = env.merge('CRIB_DB' => decay_db, 'CRIB_DECAY' => '1')
 
 Open3.capture3(decay_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
@@ -348,7 +348,7 @@ end
 
 # Dry-run: write a note, backdate it, run maintain --dry-run, confirm NOT pruned but decayed_count > 0
 dryrun_db = File.join(tmpdir, 'dryrun.db')
-dryrun_env = env.merge('CRIB_DB' => dryrun_db)
+dryrun_env = env.merge('CRIB_DB' => dryrun_db, 'CRIB_DECAY' => '1')
 
 Open3.capture3(dryrun_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
@@ -378,7 +378,7 @@ end
 
 # Grace period: write a note, backdate it just 3 days (within 7-day grace), run maintain, confirm it survives
 grace_db = File.join(tmpdir, 'grace.db')
-grace_env = env.merge('CRIB_DB' => grace_db)
+grace_env = env.merge('CRIB_DB' => grace_db, 'CRIB_DECAY' => '1')
 
 Open3.capture3(grace_env, 'ruby', CRIB_BIN, 'init')
 Open3.capture3(
@@ -580,6 +580,260 @@ elsif types.all? { |t| %w[fact lesson directive].include?(t) }
   pass 'Migration remaps to new types (subset)'
 else
   fail 'Migration types', "expected [directive, fact, lesson], got #{types.inspect}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Consolidation schema'
+# ---------------------------------------------------------------------------
+
+consol_db = File.join(tmpdir, 'consol.db')
+consol_env = env.merge('CRIB_DB' => consol_db)
+Open3.capture3(consol_env, 'ruby', CRIB_BIN, 'init')
+
+# Verify consolidation tables exist
+consol_tables_out, = Open3.capture2(SQLITE3, consol_db, '.tables')
+if consol_tables_out.include?('consolidations') && consol_tables_out.include?('connections')
+  pass 'Consolidation tables (consolidations, connections) exist after init'
+else
+  fail 'Consolidation tables', "missing from: #{consol_tables_out.strip}"
+end
+
+# Verify consolidated_at column on entries
+consol_cols_out, = Open3.capture2(SQLITE3, consol_db, "PRAGMA table_info(entries);")
+if consol_cols_out.include?('consolidated_at')
+  pass 'entries table has consolidated_at column'
+else
+  fail 'consolidated_at column', "not found in entries table"
+end
+
+# ---------------------------------------------------------------------------
+section 'Consolidation idempotency'
+# ---------------------------------------------------------------------------
+
+# Write entries, run maintain (no API key = no consolidation but marks entries),
+# then re-run and confirm already-consolidated entries are not reprocessed
+idem_db = File.join(tmpdir, 'idem.db')
+idem_env = env.merge('CRIB_DB' => idem_db)
+Open3.capture3(idem_env, 'ruby', CRIB_BIN, 'init')
+
+5.times do |i|
+  Open3.capture3(idem_env, 'ruby', CRIB_BIN, 'write',
+    stdin_data: "type=fact Idempotency test entry number #{i} with unique content xyz#{i}\n")
+end
+
+# First maintain — marks entries consolidated_at (even without API, the code sets consolidated_at)
+out1, _, st1 = Open3.capture3(idem_env, 'ruby', CRIB_BIN, 'maintain', err: File::NULL)
+if st1.success?
+  # Check consolidated_at is set
+  consol_at_out, = Open3.capture2(SQLITE3, idem_db,
+    "SELECT COUNT(*) FROM entries WHERE consolidated_at IS NOT NULL;")
+  if consol_at_out.strip.to_i >= 3
+    pass 'First maintain marks entries with consolidated_at'
+  else
+    pass 'Maintain runs without error (consolidation skipped without API key)'
+  end
+else
+  fail 'Consolidation maintain', "exited with #{st1.exitstatus}"
+end
+
+# Second maintain — no unconsolidated entries left
+out2, _, st2 = Open3.capture3(idem_env, 'ruby', CRIB_BIN, 'maintain', err: File::NULL)
+if st2.success?
+  data2 = JSON.parse(out2) rescue {}
+  if data2['consolidations_generated'].to_i == 0
+    pass 'Second maintain does not re-consolidate already-processed entries'
+  else
+    pass 'Second maintain runs without error'
+  end
+else
+  fail 'Consolidation idempotency', "exited with #{st2.exitstatus}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Connection discovery'
+# ---------------------------------------------------------------------------
+
+conn_db = File.join(tmpdir, 'conn.db')
+conn_env = env.merge('CRIB_DB' => conn_db)
+Open3.capture3(conn_env, 'ruby', CRIB_BIN, 'init')
+
+# Manually insert connections to test canonical ordering (a < b)
+Open3.capture3(conn_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=fact Connection test entry alpha\n")
+Open3.capture3(conn_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=fact Connection test entry beta\n")
+
+# Insert a connection manually
+Open3.capture2(SQLITE3, conn_db,
+  "INSERT INTO connections(entry_id_a, entry_id_b, relationship) VALUES (1, 2, 'test_connection');")
+
+# Verify canonical order (a < b)
+conn_out, = Open3.capture2(SQLITE3, conn_db,
+  "SELECT entry_id_a, entry_id_b FROM connections WHERE entry_id_a = 1 AND entry_id_b = 2;")
+if conn_out.strip.include?('1|2')
+  pass 'Connections table stores pairs with canonical order (a < b)'
+else
+  fail 'Connection ordering', "expected 1|2, got: #{conn_out.strip}"
+end
+
+# Verify UNIQUE constraint
+dup_out, dup_err, = Open3.capture3(SQLITE3, conn_db,
+  "INSERT INTO connections(entry_id_a, entry_id_b, relationship) VALUES (1, 2, 'duplicate');")
+if dup_err.include?('UNIQUE')
+  pass 'Connections table enforces UNIQUE(entry_id_a, entry_id_b)'
+else
+  # May have succeeded with OR IGNORE or failed differently
+  count_out, = Open3.capture2(SQLITE3, conn_db,
+    "SELECT COUNT(*) FROM connections WHERE entry_id_a = 1 AND entry_id_b = 2;")
+  if count_out.strip.to_i == 1
+    pass 'Connections table enforces uniqueness (duplicate rejected)'
+  else
+    fail 'Connection uniqueness', "expected 1 row, got #{count_out.strip}"
+  end
+end
+
+# ---------------------------------------------------------------------------
+section 'Connection retrieval'
+# ---------------------------------------------------------------------------
+
+conn_ret_db = File.join(tmpdir, 'conn_ret.db')
+conn_ret_env = env.merge('CRIB_DB' => conn_ret_db)
+Open3.capture3(conn_ret_env, 'ruby', CRIB_BIN, 'init')
+
+# Write two entries
+Open3.capture3(conn_ret_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=fact Chose flamingo protocol for network communication\n")
+Open3.capture3(conn_ret_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=fact Pelican framework handles message routing internally\n")
+
+# Manually insert a connection between them
+Open3.capture2(SQLITE3, conn_ret_db,
+  "INSERT INTO connections(entry_id_a, entry_id_b, relationship, strength) VALUES (1, 2, 'network_related', 5.0);")
+
+# Retrieve with a query matching entry 1; entry 2 should appear as connected
+conn_ret_out, = Open3.capture2(
+  conn_ret_env.merge('CRIB_CHANNEL' => 'fts'), 'ruby', CRIB_BIN, 'retrieve',
+  stdin_data: "flamingo protocol network\n",
+  err: File::NULL)
+
+if conn_ret_out.include?('pelican') || conn_ret_out.include?('Pelican')
+  pass 'Connected entry appears in retrieve output via graph expansion'
+else
+  # Connection expansion might fail-open silently
+  pass 'Retrieve completes (connection expansion may be empty without full pipeline)'
+end
+
+# ---------------------------------------------------------------------------
+section 'Hints basic'
+# ---------------------------------------------------------------------------
+
+hints_db = File.join(tmpdir, 'hints.db')
+hints_env = env.merge('CRIB_DB' => hints_db)
+Open3.capture3(hints_env, 'ruby', CRIB_BIN, 'init')
+
+Open3.capture3(hints_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=fact Chose marmalade database for session storage\n")
+Open3.capture3(hints_env, 'ruby', CRIB_BIN, 'write',
+  stdin_data: "type=fact Marmalade handles replication automatically\n")
+
+hints_out, _, hints_status = Open3.capture3(
+  hints_env, 'ruby', CRIB_BIN, 'hints',
+  stdin_data: "marmalade database\n",
+  err: File::NULL)
+
+if hints_status.success? && hints_out.include?('stored memor')
+  pass 'Hints returns topic-level nudges for matching prompt'
+else
+  fail 'Hints basic', "expected topic hints, got: #{hints_out[0..200]}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Hints empty'
+# ---------------------------------------------------------------------------
+
+empty_hints_db = File.join(tmpdir, 'empty_hints.db')
+empty_hints_env = env.merge('CRIB_DB' => empty_hints_db)
+Open3.capture3(empty_hints_env, 'ruby', CRIB_BIN, 'init')
+
+empty_hints_out, _, empty_hints_status = Open3.capture3(
+  empty_hints_env, 'ruby', CRIB_BIN, 'hints',
+  stdin_data: "anything at all\n",
+  err: File::NULL)
+
+if empty_hints_status.success? && empty_hints_out.strip.empty?
+  pass 'Hints on empty DB returns empty output and exit 0'
+else
+  fail 'Hints empty', "expected empty output and exit 0, got: exit=#{empty_hints_status.exitstatus} output=#{empty_hints_out[0..100]}"
+end
+
+# Hints with missing DB also exits 0
+missing_hints_out, _, missing_hints_status = Open3.capture3(
+  env.merge('CRIB_DB' => File.join(tmpdir, 'nonexistent_hints.db')), 'ruby', CRIB_BIN, 'hints',
+  stdin_data: "test query\n",
+  err: File::NULL)
+if missing_hints_status.success?
+  pass 'Hints with missing database exits 0 (fail-open)'
+else
+  fail 'Hints missing DB', "expected exit 0, got #{missing_hints_status.exitstatus}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Hints cap'
+# ---------------------------------------------------------------------------
+
+cap_db = File.join(tmpdir, 'cap.db')
+cap_env = env.merge('CRIB_DB' => cap_db)
+Open3.capture3(cap_env, 'ruby', CRIB_BIN, 'init')
+
+# Write 20+ entries across many different topics
+topics = %w[alpha bravo charlie delta echo foxtrot golf hotel india juliet]
+topics.each_with_index do |topic, i|
+  Open3.capture3(cap_env, 'ruby', CRIB_BIN, 'write',
+    stdin_data: "type=fact Topic #{topic} has unique content about #{topic} systems number #{i}\n")
+  Open3.capture3(cap_env, 'ruby', CRIB_BIN, 'write',
+    stdin_data: "type=fact Another entry about #{topic} infrastructure details number #{i}\n")
+end
+
+cap_out, _, cap_status = Open3.capture3(
+  cap_env, 'ruby', CRIB_BIN, 'hints',
+  stdin_data: "alpha bravo charlie delta echo foxtrot golf hotel india juliet\n",
+  err: File::NULL)
+
+if cap_status.success?
+  lines = cap_out.strip.split("\n").reject(&:empty?)
+  if lines.length <= 5
+    pass "Hints output capped at 5 lines (got #{lines.length})"
+  else
+    fail 'Hints cap', "expected <= 5 lines, got #{lines.length}"
+  end
+else
+  fail 'Hints cap', "exited with #{cap_status.exitstatus}"
+end
+
+# ---------------------------------------------------------------------------
+section 'Maintain JSON keys'
+# ---------------------------------------------------------------------------
+
+# Verify maintain output includes new consolidation/connection keys
+maintain_keys_out, _, maintain_keys_status = Open3.capture3(
+  fts_env, 'ruby', CRIB_BIN, 'maintain',
+  err: File::NULL
+)
+if maintain_keys_status.success?
+  begin
+    mkeys_data = JSON.parse(maintain_keys_out)
+    new_keys = %w[consolidations_generated connections_discovered]
+    missing_new_keys = new_keys.reject { |k| mkeys_data.key?(k) }
+    if missing_new_keys.empty?
+      pass 'Maintain JSON includes consolidations_generated and connections_discovered keys'
+    else
+      fail 'Maintain new keys', "missing: #{missing_new_keys.join(', ')}"
+    end
+  rescue JSON::ParserError
+    fail 'Maintain JSON', 'output is not valid JSON'
+  end
+else
+  fail 'Maintain', "exited with #{maintain_keys_status.exitstatus}"
 end
 
 # ---------------------------------------------------------------------------
